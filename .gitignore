@@ -1,0 +1,6 @@
+bin/
+.cscope*
+tags
+.cache
+compile_commands.json
+*.log

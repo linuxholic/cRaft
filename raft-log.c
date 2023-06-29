@@ -5,7 +5,7 @@
 #include <fcntl.h> // open
 #include <arpa/inet.h> // ntohl
 
-void decode_cmd(uint8_t *stream)
+void decode_state_machine_cmd(uint8_t *stream)
 {
     uint8_t *cur = stream;
 
@@ -20,7 +20,7 @@ void decode_cmd(uint8_t *stream)
         char *key = (char*)cur;
         cur += key_len;
 
-        printf("cmd: GET key(%.*s)\n", key_len, key);
+        printf("state machine cmd: GET key(%.*s)\n", key_len, key);
     }
     else if (cmd_type == 2) // CMD_SET
     {
@@ -36,15 +36,63 @@ void decode_cmd(uint8_t *stream)
         char *value = (char*)cur;
         cur += value_len;
 
-        printf("cmd: SET key(%.*s) value(%.*s)\n",
+        printf("state machine cmd: SET key(%.*s) value(%.*s)\n",
                 key_len, key, value_len, value);
     }
-    else if (cmd_type == 3) // CMD_NOOP
-    {
-        printf("cmd: noop\n");
-    }
     else {
-        printf("cmd: unknown type: %d.\n", cmd_type);
+        printf("state machine cmd: unknown type: %d.\n", cmd_type);
+    }
+}
+
+void decode_configuration_entry(uint8_t *cur)
+{
+    int addr_num = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    for (int i = 0; i < addr_num; i++)
+    {
+        int ip_len = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        printf("%.*s:", ip_len, (char*)cur);
+        cur += ip_len;
+
+        int port = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+        printf("%d", port);
+
+        int id = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+        printf("(%d)", id);
+        
+        if (i != addr_num - 1)
+        {
+            printf(", ");
+        }
+    }
+    printf("\n");
+}
+
+void decode_cmd(uint8_t *stream)
+{
+    uint8_t *cur = stream;
+
+    int cmd_type = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    switch (cmd_type)
+    {
+        case 1:
+            decode_state_machine_cmd(cur);
+            break;
+        case 2:
+            printf("no-op\n");
+            break;
+        case 3:
+            decode_configuration_entry(cur);
+            break;
+        default:
+            printf("unknown raft command type: %d\n", cmd_type);
     }
 }
 

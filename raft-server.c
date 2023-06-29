@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <errno.h>
 
 #include "net.h"
 #include "hash.h"
@@ -13,6 +14,13 @@ struct raft_log_entry_cmd
 {
     void *buf;
     int len; // bytes
+
+    /*
+     * 1: state machine
+     * 2: no-op log entry, upon leader elected
+     * 3: configuration entry / membership change
+     */
+    int type;
 };
 
 struct kv_raft_ctx
@@ -38,6 +46,9 @@ struct raft_peer
 {
     char *addr;
     int port;
+
+    // TODO: use hash table to bind id and peer
+    int id;
 };
 
 struct raft_cluster
@@ -409,12 +420,6 @@ struct kv_cmd* parse_cmd(uint8_t *stream)
         cmd->key = key;
         cmd->value = value;
     }
-    else if (cmd_type == 3) // CMD_SET
-    {
-        loginfo("command noop.\n");
-        cmd->key = NULL;
-        cmd->value = NULL;
-    }
     else {
         logerr("client request unknown cmd type: %d.\n", cmd_type);
     }
@@ -446,18 +451,15 @@ void raft_log_delete(struct raft_server *rs, int idx)
     rs->lastLogTerm = rs->entries[rs->lastLogIndex - 1].term;
 }
 
-// TODO: this should be registered by state machine into raft, then raft
-// will call it when log entry is considered to be commited.
-// ie, raft_register_state_machine_apply_callback() API
-//
-// maybe better parameters:
-// * command buffer
-// * state machine ctx
 void raft_apply_state_machine(struct raft_server *rs, int index)
 {
     struct raft_log_entry *e = &rs->entries[index - 1];
 
-    struct kv_cmd *cmd = parse_cmd(e->cmd.buf);
+    uint8_t *cur = e->cmd.buf;
+    cur += sizeof(uint32_t); // skip cmd type
+
+    // TODO: use gcc extentsion __attribute__(cleanup)
+    struct kv_cmd *cmd = parse_cmd(cur);
     struct kv_server *kvs = rs->st;
     switch (cmd->type)
     {
@@ -470,15 +472,83 @@ void raft_apply_state_machine(struct raft_server *rs, int index)
             loginfo("log[%d] apply state machine, SET key: %s, value: %s\n",
                     index, cmd->key, cmd->value);
             break;
-        case 3:
-            loginfo("log[%d] apply state machine, noop.\n", index);
-            break;
         default:
             logerr("log[%d] apply state machine, unknown kv cmd type: %d\n",
                     index, cmd->type);
     }
-
     free(cmd);
+}
+
+int parse_log_entry_type(struct raft_log_entry *e)
+{
+    uint32_t *buf = e->cmd.buf;
+    return ntohl(buf[0]);
+}
+
+/*
+ * configuration entry format:
+ * addr_num | ip_len | ip_str | port | id
+ */
+void raft_apply_membership_change(
+        struct raft_server *rs, struct raft_log_entry *e)
+{
+    uint8_t *cur = e->cmd.buf;
+    cur += sizeof(uint32_t); // skip cmd type
+
+    int addr_num = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    // TODO: free previous cluster space
+    struct raft_cluster *rc = rs->cluster;
+    rc->number = addr_num;
+    rc->peers = malloc(sizeof(struct raft_peer) * rc->number);
+
+    for (int i = 0; i < addr_num; i++)
+    {
+        int ip_len = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        rc->peers[i].addr = strndup((char*)cur, ip_len);
+        cur += ip_len;
+
+        int port = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        rc->peers[i].port = port;
+
+        int id = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        rc->peers[i].id = id;
+    }
+}
+
+// TODO: this should be registered by state machine into raft, then raft
+// will call it when log entry is considered to be commited.
+// ie, raft_register_state_machine_apply_callback() API
+//
+// maybe better parameters:
+// * command buffer
+// * state machine ctx
+void raft_apply(struct raft_server *rs, int index)
+{
+    struct raft_log_entry *e = &rs->entries[index - 1];
+
+    int type = parse_log_entry_type(e);
+    switch (type)
+    {
+        case 1:
+            raft_apply_state_machine(rs, index);
+            break;
+        case 2:
+            loginfo("apply no-op log entry.\n");
+            break;
+        case 3:
+            raft_apply_membership_change(rs, e);
+            break;
+        default:
+            logerr("unknown log entry cmd type: %d\n", type);
+    }
 }
 
 void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
@@ -621,7 +691,7 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
                 rs->lastApplied, rs->lastApplied + 1);
 
         rs->lastApplied++;
-        raft_apply_state_machine(rs, rs->lastApplied);
+        raft_apply(rs, rs->lastApplied);
     }
 }
 
@@ -809,7 +879,7 @@ void raft_try_commit(struct raft_server *rs, int index)
                     rs->lastApplied, rs->lastApplied + 1);
 
             rs->lastApplied++;
-            raft_apply_state_machine(rs, rs->lastApplied);
+            raft_apply(rs, rs->lastApplied);
 
             raft_on_commit(rs, rs->lastApplied);
         }
@@ -1039,10 +1109,12 @@ struct raft_log_entry *raft_noop_log(struct raft_server *rs)
 {
     struct raft_log_entry *e = &rs->entries[rs->lastLogIndex];
 
-    uint32_t cmd_type = htonl(3); // no-op cmd type
     e->term = rs->currentTerm;
     e->cmd.len = sizeof(uint32_t);
     e->cmd.buf = malloc(e->cmd.len);
+
+    // fill command buffer
+    uint32_t cmd_type = htonl(2); // per no-op
     memcpy(e->cmd.buf, &cmd_type, e->cmd.len);
 
     return e;
@@ -1067,6 +1139,23 @@ void raft_log_replication(struct raft_server *rs,
         _AppendEntries_invoke(rs, peer, entry);
     }
     net_timer_reset(rs->heartbeat_timer, 2, 2);
+}
+
+void raft_become_leader(struct raft_server *rs)
+{
+    rs->state = LEADER;
+
+    net_timer_reset(rs->election_timer, 0, 0); // pause
+    raft_reset_nextIndex(rs);
+    raft_reset_matchIndex(rs);
+
+    // setup periodical heartbeat to peers
+    raft_leader_heartbeat(rs->tcp_server->loop, rs);
+
+    // commit no-op log entry, and as a side effect, this will
+    // also prevent other peers from starting new election.
+    struct raft_log_entry *e = raft_noop_log(rs);
+    raft_log_replication(rs, e);
 }
 
 int __RequestVote_invoke(char *start, size_t size, net_connect_t *c)
@@ -1095,21 +1184,9 @@ int __RequestVote_invoke(char *start, size_t size, net_connect_t *c)
 
         if (rs->votes > rs->cluster->number / 2)
         {
-            rs->state = LEADER;
-            loginfo("node(%d) recv majority votes, convert to LEADER.\n",
-                    rs->id);
-
-            net_timer_reset(rs->election_timer, 0, 0); // pause
-            raft_reset_nextIndex(rs);
-            raft_reset_matchIndex(rs);
-
-            // setup periodical heartbeat to peers
-            raft_leader_heartbeat(c->loop, rs);
-
-            // commit no-op log entry, and as a side effect, this will
-            // also prevent other peers from starting new election.
-            struct raft_log_entry *e = raft_noop_log(rs);
-            raft_log_replication(rs, e);
+            loginfo("node(%d) recv majority votes, "
+                    "convert to LEADER.\n", rs->id);
+            raft_become_leader(rs);
         }
     }
     else {
@@ -1212,6 +1289,8 @@ void start_election(net_timer_t *election_timer)
         RequestVote_invoke(rs, peer);
     }
 
+    // TODO: check votes against majority, in case of cluster init
+
     // in case of split votes
     net_timer_reset(election_timer, random_ElecttionTimeout(), 0);
 }
@@ -1247,9 +1326,6 @@ void client_response(void *arg)
             net_buf_append(reply, "SET key: %s, value: %s",
                     cmd->key, cmd->value);
             break;
-        case 3:
-            net_buf_append(reply, "noop");
-            break;
         default:
             logerr("unknown kv cmd type: %d\n", cmd->type);
     }
@@ -1274,9 +1350,13 @@ struct raft_log_entry *raft_fill_log_entry(struct raft_server *rs,
     struct raft_log_entry *entry = &rs->entries[rs->lastLogIndex];
 
     entry->term = rs->currentTerm;
-    entry->cmd.len = size;
-    entry->cmd.buf = malloc(size);
-    memcpy(entry->cmd.buf, start, size);
+    entry->cmd.len = size + sizeof(uint32_t);
+    entry->cmd.buf = malloc(entry->cmd.len);
+
+    // fill command buffer
+    uint32_t cmd_type = 1; // per state machine
+    memcpy(entry->cmd.buf, &cmd_type, sizeof(uint32_t));
+    memcpy(entry->cmd.buf + sizeof(uint32_t), start, size);
 
     return entry;
 }
@@ -1316,26 +1396,93 @@ void raft_server_stop(net_loop_t *loop, void *arg)
     free(rs->cluster);
     free(rs->nextIndex);
     free(rs->matchIndex);
+    close(rs->log_fd);
     free(rs);
+}
+
+void raft_init(char *path)
+{
+    int fd = open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IROTH);
+    if (fd < 0)
+    {
+        logerr("failed to open raft log '%s': %s\n",
+                path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    int currentTerm = 1;
+    write(fd, &currentTerm, 4);
+    int votedFor = -1;
+    write(fd, &votedFor, 4);
+
+    // configuration entry
+    write(fd, &currentTerm, 4);
+
+    off_t a = lseek(fd, 0, SEEK_CUR);
+    int cmd_len = 10086; // placeholder
+    write(fd, &cmd_len, 4);
+    off_t b = lseek(fd, 0, SEEK_CUR);
+
+    // fill command buffer: these data is transfered as raw bytes, so
+    // we better convert them to network byte order in advance
+    int cmd_type = htonl(3); // per membership change
+    write(fd, &cmd_type, 4);
+    int addr_num = htonl(1);
+    write(fd, &addr_num, 4);
+    char *ip = "127.0.0.1";
+    int ip_len = strlen(ip);
+    int _ip_len = htonl(ip_len);
+    write(fd, &_ip_len, 4);
+    write(fd, ip, ip_len);
+    int port = htonl(7777);
+    write(fd, &port, 4);
+    int id = htonl(0);
+    write(fd, &id, 4);
+
+    // backpatching
+    off_t c = lseek(fd, 0, SEEK_CUR);
+    lseek(fd, a, SEEK_SET);
+    cmd_len = c - b;
+    write(fd, &cmd_len, 4);
+
+    fsync(fd);
+    close(fd);
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3)
+    int node_id;
+    char *init;
+    switch (argc)
     {
-        printf("usage: %s node_id, node_amount\n", argv[0]);
+        case 2:
+            init = NULL;
+            node_id = strtol(argv[1], NULL, 10);
+            break;
+        case 3:
+            node_id = strtol(argv[1], NULL, 10);
+            init = argv[2];
+            break;
+        default:
+            printf("usage: %s node_id [init]\n", argv[0]);
+            exit(EXIT_FAILURE);
+    }
+
+    if (init && strcmp(init, "init") != 0)
+    {
+        printf("usage: %s node_id [init]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
     net_log_level(LOG_INFO);
-
-    int node_id = strtol(argv[1], NULL, 10);
-    int node_amount = strtol(argv[2], NULL, 10);
-
     net_loop_t *loop = net_loop_init(EPOLL_SIZE);
-    net_server_t *server = net_server_init(loop, "0.0.0.0", 7777 + node_id);
+
+    net_server_t *server =
+        net_server_init(loop, "127.0.0.1", 7777 + node_id);
     net_server_set_message_callback(server, peer_rpc);
-    net_server_t *app_server = net_server_init(loop, "0.0.0.0", 8888 + node_id);
+
+    net_server_t *app_server =
+        net_server_init(loop, "127.0.0.1", 8888 + node_id);
     net_server_set_message_callback(app_server, client_request);
 
     struct raft_server *rs = malloc(sizeof(struct raft_server));
@@ -1350,10 +1497,14 @@ int main(int argc, char *argv[])
 
     char path[1024];
     sprintf(path, "replicated-%d.log", node_id);
+    if (init)
+    {
+        // self form majority, so write local log
+        // also means commited.
+        rs->commitIndex = 1;
+        raft_init(path);
+    }
     raft_restore_log(rs, path);
-
-    loginfo("raft node startup: state(%s), node_id(%d), node_amount(%d)\n",
-            raft_state(rs->state), node_id, node_amount);
 
     // so we can get @rs within every incoming connection
     net_server_set_accept_callback(server, bind_raft_server, rs);
@@ -1364,22 +1515,18 @@ int main(int argc, char *argv[])
     net_server_set_accept_callback(app_server, bind_kv_server, kvs);
     rs->st = kvs;
 
-    // construct raft cluster
-    struct raft_cluster *rc = malloc(sizeof(struct raft_cluster));
-    rc->number = node_amount;
-
-    rc->peers = malloc(sizeof(struct raft_peer) * rc->number);
-    for (int i = 0; i < rc->number; i++)
+    rs->cluster = malloc(sizeof(struct raft_cluster));
+    if (init)
     {
-        rc->peers[i].addr = "0.0.0.0";
-        rc->peers[i].port = 7777 + i;
+        // load membership configuration to fulfil cluster struct
+        rs->lastApplied++;
+        raft_apply(rs, rs->lastApplied);
     }
-    rs->cluster = rc;
 
     rs->nextIndex = malloc(sizeof(int) * rs->cluster->number);
-    raft_reset_nextIndex(rs);
+    // raft_reset_nextIndex(rs);
     rs->matchIndex = malloc(sizeof(int) * rs->cluster->number);
-    raft_reset_matchIndex(rs);
+    // raft_reset_matchIndex(rs);
 
     rs->inFlight = calloc(rs->cluster->number, sizeof(int));
 
@@ -1388,6 +1535,10 @@ int main(int argc, char *argv[])
     net_timer_start(timer, start_election, rs);
     rs->election_timer = timer;
     rs->heartbeat_timer = NULL;
+
+    if (init) raft_become_leader(rs);
+    loginfo("raft node startup: state(%s), node_id(%d)\n",
+            raft_state(rs->state), node_id);
 
     net_loop_set_stop_callback(loop, raft_server_stop, kvs);
     net_loop_start(loop);

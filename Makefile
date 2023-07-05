@@ -9,6 +9,9 @@ raft-server: raft-server.c $(CORE)
 raft-client: raft-client.c $(CORE)
 	gcc $(CFLAGS) $^ -o bin/$@
 
+raft-admin: raft-admin.c $(CORE)
+	gcc $(CFLAGS) $^ -o bin/$@
+
 raft-log: raft-log.c $(CORE)
 	gcc $(CFLAGS) $^ -o bin/$@
 

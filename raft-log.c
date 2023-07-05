@@ -20,7 +20,7 @@ void decode_state_machine_cmd(uint8_t *stream)
         char *key = (char*)cur;
         cur += key_len;
 
-        printf("state machine cmd: GET key(%.*s)\n", key_len, key);
+        printf("GET key(%.*s)\n", key_len, key);
     }
     else if (cmd_type == 2) // CMD_SET
     {
@@ -36,11 +36,11 @@ void decode_state_machine_cmd(uint8_t *stream)
         char *value = (char*)cur;
         cur += value_len;
 
-        printf("state machine cmd: SET key(%.*s) value(%.*s)\n",
+        printf("SET key(%.*s) value(%.*s)\n",
                 key_len, key, value_len, value);
     }
     else {
-        printf("state machine cmd: unknown type: %d.\n", cmd_type);
+        printf("unknown state machine cmd type: %d.\n", cmd_type);
     }
 }
 

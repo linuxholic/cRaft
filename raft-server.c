@@ -66,8 +66,10 @@ enum raft_server_state
 
 enum raft_rpc_type
 {
-    REQUEST_VOTE = 1,
-    APPEND_ENTRIES
+    REQUEST_VOTE = 1
+    , APPEND_ENTRIES
+    , ADD_SERVER
+    , REMOVE_SERVER
 };
 
 struct raft_server
@@ -492,16 +494,23 @@ int parse_log_entry_type(struct raft_log_entry *e)
 void raft_apply_membership_change(
         struct raft_server *rs, struct raft_log_entry *e)
 {
+    if (rs->state == LEADER)
+    {
+        loginfo("leader skip apply configuration entry\n");
+        return;
+    }
+
     uint8_t *cur = e->cmd.buf;
     cur += sizeof(uint32_t); // skip cmd type
 
     int addr_num = ntohl(*(uint32_t*)cur);
     cur += sizeof(uint32_t);
 
-    // TODO: free previous cluster space
     struct raft_cluster *rc = rs->cluster;
     rc->number = addr_num;
-    rc->peers = malloc(sizeof(struct raft_peer) * rc->number);
+    rc->peers = realloc(rc->peers, sizeof(struct raft_peer) * rc->number);
+
+    loginfo("apply configuration entry: addr_num(%d)\n", addr_num);
 
     for (int i = 0; i < addr_num; i++)
     {
@@ -520,6 +529,9 @@ void raft_apply_membership_change(
         cur += sizeof(uint32_t);
 
         rc->peers[i].id = id;
+
+        loginfo("%.*s:%d(%d)\n", ip_len, rc->peers[i].addr,
+                rc->peers[i].port, rc->peers[i].id);
     }
 }
 
@@ -695,133 +707,34 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
     }
 }
 
-int raft_follower(char *start, size_t size, net_connect_t *c)
+struct raft_log_entry *raft_fill_log_entry(struct raft_server *rs,
+        char *start, size_t size)
 {
-    // decode results
-    uint32_t *res = (uint32_t *)start;
-    uint32_t rpc_type = ntohl(res[0]);
+    struct raft_log_entry *entry = &rs->entries[rs->lastLogIndex];
 
-    switch (rpc_type)
-    {
-        case REQUEST_VOTE:
-            if (size < 20)
-            {
-                loginfo("RequestVote RPC: partial results.\n");
-                return 0;
-            }
-            RequestVote_receiver(c, res);
-            break;
+    entry->term = rs->currentTerm;
+    entry->cmd.len = size + sizeof(uint32_t);
+    entry->cmd.buf = malloc(entry->cmd.len);
 
-        case APPEND_ENTRIES:
-            if (size < 28) // TODO: non-empty AppendEntries RPC
-            {
-                loginfo("AppendEntries RPC: partial results.\n");
-                return 0;
-            }
-            AppendEntries_receiver(c, res);
-            break;
+    // fill command buffer
+    uint32_t cmd_type = htonl(1); // per state machine
+    memcpy(entry->cmd.buf, &cmd_type, sizeof(uint32_t));
+    memcpy(entry->cmd.buf + sizeof(uint32_t), start, size);
 
-        default:
-            logerr("raft follower recv unknown rpc type: %u\n", rpc_type);
-            break;
-    }
-
-    return size;
+    return entry;
 }
 
-int raft_candidate(char *start, int size, net_connect_t *c)
+struct raft_log_entry *raft_fill_configuration_entry(struct raft_server *rs,
+        char *start, size_t size)
 {
-    struct raft_server *rs = c->data;
-    // decode results
-    uint32_t *res = (uint32_t *)start;
-    uint32_t rpc_type = ntohl(res[0]);
+    struct raft_log_entry *entry = &rs->entries[rs->lastLogIndex];
 
-    switch (rpc_type)
-    {
-        case REQUEST_VOTE:
-            if (size < 20)
-            {
-                loginfo("RequestVote RPC: partial results.\n");
-                return 0;
-            }
-            RequestVote_receiver(c, res);
-            break;
+    entry->term = rs->currentTerm;
+    entry->cmd.len = size;
+    entry->cmd.buf = malloc(entry->cmd.len);
+    memcpy(entry->cmd.buf, start, size);
 
-        case APPEND_ENTRIES:
-            if (size < 28) // TODO: non-empty AppendEntries RPC
-            {
-                loginfo("AppendEntries RPC: partial results.\n");
-                return 0;
-            }
-            AppendEntries_receiver(c, res);
-            break;
-
-        default:
-            logerr("raft candidate recv unknown rpc type: %u\n", rpc_type);
-            break;
-    }
-
-    return size;
-}
-
-int raft_leader(char *start, int size, net_connect_t *c)
-{
-    // decode results
-    uint32_t *res = (uint32_t *)start;
-    uint32_t rpc_type = ntohl(res[0]);
-
-    switch (rpc_type)
-    {
-        case REQUEST_VOTE:
-            // TODO: MAYBE convert to follower, it depends.
-            //
-            // if one follower can't recv packets while it can
-            // send out packets, then leader should not step down.
-            //
-            // if there is a STABLE leader arcoss the whole
-            // cluster, then RequestVote with bigger term should
-            // be ignored, which is also the situation when changing
-            // memebers, say, remove one from cluster.
-            loginfo("raft leader recv RequestVote RPC, ignore it.\n");
-            break;
-
-        case APPEND_ENTRIES:
-            if (size < 28) // TODO: non-empty AppendEntries RPC
-            {
-                loginfo("AppendEntries RPC: partial results.\n");
-                return 0;
-            }
-            AppendEntries_receiver(c, res);
-            break;
-
-        default:
-            logerr("raft leader recv unknown rpc type: %u\n", rpc_type);
-            break;
-    }
-
-    return size;
-}
-
-int peer_rpc(char *start, size_t size, net_connect_t *c)
-{
-    int parsed = 0;
-    struct raft_server *rs = c->data;
-    switch (rs->state)
-    {
-        case LEADER:
-            parsed = raft_leader(start, size, c);
-            break;
-        case FOLLOWER:
-            parsed = raft_follower(start, size, c);
-            break;
-        case CANDIDATE:
-            parsed = raft_candidate(start, size, c);
-            break;
-        default:
-            logerr("role: undefined\n");
-            break;
-    }
-    return parsed;
+    return entry;
 }
 
 int raft_get_id(char *host, int port)
@@ -834,7 +747,7 @@ void raft_on_commit(struct raft_server *rs, int index)
     struct raft_log_entry *e = &rs->entries[index - 1];
     if (e->cb_handle)
     {
-        loginfo("log entry commited, trigger state machine callback.\n");
+        loginfo("log entry commited, trigger callback.\n");
 
         rs->lastApplied = index;
         e->cb_handle(e->cb_arg);
@@ -845,7 +758,7 @@ void raft_on_commit(struct raft_server *rs, int index)
         e->cb_arg = NULL;
     }
     else {
-        loginfo("log entry commited, NO state machine callback.\n");
+        loginfo("log entry commited, NO callback.\n");
     }
 }
 
@@ -901,6 +814,7 @@ void raft_commit(struct raft_server *rs)
         try_commit++;
     }
 }
+
 
 int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
 {
@@ -1038,6 +952,13 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
     net_client_set_user_data(c->client, rs);
 }
 
+void raft_commit_callback(struct raft_log_entry *e,
+        commit_handler cb, void *arg)
+{
+    e->cb_handle = cb;
+    e->cb_arg = arg;
+}
+
 void _AppendEntries_invoke(struct raft_server *local, struct raft_peer *peer,
         struct raft_log_entry *entries)
 {
@@ -1056,6 +977,284 @@ void _AppendEntries_invoke(struct raft_server *local, struct raft_peer *peer,
 
     net_client_set_connection_callback(client, __AppendEntries_invoke, local);
     net_client_set_user_data(client, entries);
+}
+
+/*
+ * 1. write local log
+ * 2. replicate log entry to raft peers
+ */
+void raft_log_replication(struct raft_server *rs,
+        struct raft_log_entry *entry)
+{
+    raft_persist_log(rs, entry);
+
+    rs->nextIndex[rs->id]++;
+    rs->matchIndex[rs->id] = rs->lastLogIndex;
+
+    // replicate log entry to peers
+    for (int i = 0; i < rs->cluster->number; i++)
+    {
+        struct raft_peer *peer = &rs->cluster->peers[i];
+        _AppendEntries_invoke(rs, peer, entry);
+    }
+
+    // raft cluster containing only one node, which is often the case
+    // when bootstrap a whole new raft cluster.
+    if (rs->cluster->number == 1)
+    {
+        raft_commit(rs);
+    }
+
+    net_timer_reset(rs->heartbeat_timer, 2, 2);
+}
+
+void AddServer_response(void *arg)
+{
+    net_connect_t *c = arg;
+    if (c->err) return;
+
+    net_buf_t *reply = net_buf_create(0);
+    net_buf_append(reply, "OK");
+
+    list_append(&c->outbuf, &reply->node);
+    net_connection_send(c);
+}
+
+void AddServer_receiver(net_connect_t *c, uint32_t *res)
+{
+    uint8_t *cur = (uint8_t*)(res + 1); // skip raft rpc type
+    struct raft_server *rs = c->data;
+
+    uint32_t ip_len = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    char *server_ip = strndup((char*)cur, ip_len);
+    cur += ip_len;
+
+    uint32_t server_port = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    uint32_t server_id = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    loginfo("[%s] recv AddServer RPC: %.*s:%d(%d)\n",
+            raft_state(rs->state),
+            ip_len, server_ip, server_port, server_id);
+
+    /*
+     * TODO:
+     * 1. Reply NOT_LEADER if not leader
+     * 2. Catch up new server
+     *   2.1 Reply TIMEOUT if new server
+     *     * does not make progress for an election timeout
+     *     * the last round takes longer than the election timeout
+     * 3. Wait until previous configuration entry is commited
+     */
+
+    /*
+     * 1. rebuild raft cluster
+     * 2. rebuild nextIndex[]
+     * 3. rebuild matchIndex[]
+     */
+
+    struct raft_cluster *rc = rs->cluster;
+    rc->number++;
+    rc->peers = realloc(rc->peers, sizeof(struct raft_peer) * rc->number);
+    rc->peers[rc->number - 1].addr = server_ip;
+    rc->peers[rc->number - 1].port = server_port;
+    rc->peers[rc->number - 1].id = server_id;
+
+    rs->nextIndex = realloc(rs->nextIndex, sizeof(int) * rc->number);
+    rs->nextIndex[rc->number - 1] = rs->lastLogIndex + 1;
+
+    rs->matchIndex = realloc(rs->matchIndex, sizeof(int) * rc->number);
+    rs->matchIndex[rc->number - 1] = 0;
+
+    /*
+     * fill command buffer (encoding) and refer to
+     * raft_apply_membership_change for decoding
+     */
+
+    int buf_len = (sizeof(uint32_t)    // cmd type
+                 + sizeof(uint32_t));; // addr num
+    void *buf = malloc(buf_len);
+
+    int cmd_type = htonl(3); // per membership change
+    memcpy(buf, &cmd_type, sizeof(uint32_t));
+
+    int addr_num = htonl(rc->number);
+    memcpy(buf + sizeof(uint32_t), &addr_num, sizeof(uint32_t));
+
+    for (int i = 0; i < rc->number; i++)
+    {
+        int prev_len = buf_len;
+
+        ip_len = strlen(rc->peers[i].addr);
+        buf_len += sizeof(uint32_t)    // ip len
+                   + ip_len            // ip
+                   + sizeof(uint32_t)  // port
+                   + sizeof(uint32_t); // id
+
+        buf = realloc(buf, buf_len);
+        cur = buf + prev_len;
+
+        uint32_t _ip_len = htonl(ip_len);
+        memcpy(cur, &_ip_len, sizeof(uint32_t));
+        cur += sizeof(uint32_t);
+
+        memcpy(cur, rc->peers[i].addr, ip_len);
+        cur += ip_len;
+
+        server_port = htonl(rc->peers[i].port);
+        memcpy(cur, &server_port, sizeof(uint32_t));
+        cur += sizeof(uint32_t);
+
+        server_id = htonl(rc->peers[i].id);
+        memcpy(cur, &server_id, sizeof(uint32_t));
+        cur += sizeof(uint32_t);
+    }
+
+    struct raft_log_entry *e = raft_fill_configuration_entry(rs, buf, buf_len);
+    raft_log_replication(rs, e);
+    raft_commit_callback(e, AddServer_response, c);
+}
+
+int raft_follower(char *start, size_t size, net_connect_t *c)
+{
+    // decode results
+    uint32_t *res = (uint32_t *)start;
+    uint32_t rpc_type = ntohl(res[0]);
+
+    switch (rpc_type)
+    {
+        case REQUEST_VOTE:
+            if (size < 20)
+            {
+                loginfo("RequestVote RPC: partial results.\n");
+                return 0;
+            }
+            RequestVote_receiver(c, res);
+            break;
+
+        case APPEND_ENTRIES:
+            if (size < 28) // TODO: non-empty AppendEntries RPC
+            {
+                loginfo("AppendEntries RPC: partial results.\n");
+                return 0;
+            }
+            AppendEntries_receiver(c, res);
+            break;
+
+        default:
+            logerr("raft follower recv unknown rpc type: %u\n", rpc_type);
+            break;
+    }
+
+    return size;
+}
+
+int raft_candidate(char *start, int size, net_connect_t *c)
+{
+    struct raft_server *rs = c->data;
+    // decode results
+    uint32_t *res = (uint32_t *)start;
+    uint32_t rpc_type = ntohl(res[0]);
+
+    switch (rpc_type)
+    {
+        case REQUEST_VOTE:
+            if (size < 20)
+            {
+                loginfo("RequestVote RPC: partial results.\n");
+                return 0;
+            }
+            RequestVote_receiver(c, res);
+            break;
+
+        case APPEND_ENTRIES:
+            if (size < 28) // TODO: non-empty AppendEntries RPC
+            {
+                loginfo("AppendEntries RPC: partial results.\n");
+                return 0;
+            }
+            AppendEntries_receiver(c, res);
+            break;
+
+        default:
+            logerr("raft candidate recv unknown rpc type: %u\n", rpc_type);
+            break;
+    }
+
+    return size;
+}
+
+int raft_leader(char *start, int size, net_connect_t *c)
+{
+    // decode results
+    uint32_t *res = (uint32_t *)start;
+    uint32_t rpc_type = ntohl(res[0]);
+
+    switch (rpc_type)
+    {
+        case REQUEST_VOTE:
+            // TODO: MAYBE convert to follower, it depends.
+            //
+            // if one follower can't recv packets while it can
+            // send out packets, then leader should not step down.
+            //
+            // if there is a STABLE leader arcoss the whole
+            // cluster, then RequestVote with bigger term should
+            // be ignored, which is also the situation when changing
+            // memebers, say, remove one from cluster.
+            loginfo("raft leader recv RequestVote RPC, ignore it.\n");
+            break;
+
+        case APPEND_ENTRIES:
+            if (size < 28) // TODO: non-empty AppendEntries RPC
+            {
+                loginfo("AppendEntries RPC: partial results.\n");
+                return 0;
+            }
+            AppendEntries_receiver(c, res);
+            break;
+
+        case ADD_SERVER:
+            if (size < 25)
+            {
+                loginfo("AddServer RPC: partial results.\n");
+                return 0;
+            }
+            AddServer_receiver(c, res);
+            break;
+
+        default:
+            logerr("raft leader recv unknown rpc type: %u\n", rpc_type);
+            break;
+    }
+
+    return size;
+}
+
+int peer_rpc(char *start, size_t size, net_connect_t *c)
+{
+    int parsed = 0;
+    struct raft_server *rs = c->data;
+    switch (rs->state)
+    {
+        case LEADER:
+            parsed = raft_leader(start, size, c);
+            break;
+        case FOLLOWER:
+            parsed = raft_follower(start, size, c);
+            break;
+        case CANDIDATE:
+            parsed = raft_candidate(start, size, c);
+            break;
+        default:
+            logerr("role: undefined\n");
+            break;
+    }
+    return parsed;
 }
 
 void AppendEntries_invoke_empty(net_timer_t *timer)
@@ -1118,27 +1317,6 @@ struct raft_log_entry *raft_noop_log(struct raft_server *rs)
     memcpy(e->cmd.buf, &cmd_type, e->cmd.len);
 
     return e;
-}
-
-/*
- * 1. write local log
- * 2. replicate log entry to raft peers
- */
-void raft_log_replication(struct raft_server *rs,
-        struct raft_log_entry *entry)
-{
-    raft_persist_log(rs, entry);
-
-    rs->nextIndex[rs->id]++;
-    rs->matchIndex[rs->id] = rs->lastLogIndex;
-
-    // replicate log entry to peers
-    for (int i = 0; i < rs->cluster->number; i++)
-    {
-        struct raft_peer *peer = &rs->cluster->peers[i];
-        _AppendEntries_invoke(rs, peer, entry);
-    }
-    net_timer_reset(rs->heartbeat_timer, 2, 2);
 }
 
 void raft_become_leader(struct raft_server *rs)
@@ -1289,8 +1467,6 @@ void start_election(net_timer_t *election_timer)
         RequestVote_invoke(rs, peer);
     }
 
-    // TODO: check votes against majority, in case of cluster init
-
     // in case of split votes
     net_timer_reset(election_timer, random_ElecttionTimeout(), 0);
 }
@@ -1344,30 +1520,6 @@ void client_response(void *arg)
     free(ctx);
 }
 
-struct raft_log_entry *raft_fill_log_entry(struct raft_server *rs,
-        char *start, size_t size)
-{
-    struct raft_log_entry *entry = &rs->entries[rs->lastLogIndex];
-
-    entry->term = rs->currentTerm;
-    entry->cmd.len = size + sizeof(uint32_t);
-    entry->cmd.buf = malloc(entry->cmd.len);
-
-    // fill command buffer
-    uint32_t cmd_type = 1; // per state machine
-    memcpy(entry->cmd.buf, &cmd_type, sizeof(uint32_t));
-    memcpy(entry->cmd.buf + sizeof(uint32_t), start, size);
-
-    return entry;
-}
-
-void raft_commit_callback(struct raft_log_entry *e,
-        commit_handler cb, void *arg)
-{
-    e->cb_handle = cb;
-    e->cb_arg = arg;
-}
-
 int client_request(char *start, size_t size, net_connect_t *c)
 {
     struct kv_server *kvs = c->data;
@@ -1385,6 +1537,16 @@ int client_request(char *start, size_t size, net_connect_t *c)
     return size;
 }
 
+void raft_free_cluster(struct raft_cluster *rc)
+{
+    for (int i = 0; i < rc->number; i++)
+    {
+        free(rc->peers[i].addr);
+    }
+    free(rc->peers);
+    free(rc);
+}
+
 void raft_server_stop(net_loop_t *loop, void *arg)
 {
     struct kv_server *kvs = arg;
@@ -1392,8 +1554,7 @@ void raft_server_stop(net_loop_t *loop, void *arg)
     free(kvs);
 
     struct raft_server *rs = kvs->rs;
-    free(rs->cluster->peers);
-    free(rs->cluster);
+    raft_free_cluster(rs->cluster);
     free(rs->nextIndex);
     free(rs->matchIndex);
     close(rs->log_fd);
@@ -1515,7 +1676,7 @@ int main(int argc, char *argv[])
     net_server_set_accept_callback(app_server, bind_kv_server, kvs);
     rs->st = kvs;
 
-    rs->cluster = malloc(sizeof(struct raft_cluster));
+    rs->cluster = calloc(1, sizeof(struct raft_cluster));
     if (init)
     {
         // load membership configuration to fulfil cluster struct

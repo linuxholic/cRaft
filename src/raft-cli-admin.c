@@ -3,21 +3,13 @@
 #include <stdio.h>
 
 #include "net.h"
+#include "raft.h"
 
 struct Server
 {
     char *host;
     int port;
     int id;
-};
-
-// TODO: we need a common raft.h header file, right?
-enum raft_rpc_type
-{
-    REQUEST_VOTE = 1
-    , APPEND_ENTRIES
-    , ADD_SERVER
-    , REMOVE_SERVER
 };
 
 void addServer(net_connect_t *c, void *arg)
@@ -38,6 +30,7 @@ void addServer(net_connect_t *c, void *arg)
 
     // TODO: better to use fixed-length ip string, ie
     //       standard IP format, say, 127.000.000.001
+
     /*
      * ip_len | ip_str | port | id
      */
@@ -68,13 +61,36 @@ void removeServer(net_connect_t *c, void *arg)
         return;
     }
 
-    /*
-     * configuration entry format:
-     * addr_num | ip_len | ip_str | port | id
-     */
-    net_buf_t *buf = net_buf_create(0);
+    net_buf_t *reply = net_buf_create(0);
 
-    list_append(&c->outbuf, &buf->node);
+    // encode raft rpc type
+    uint32_t rpc_type = htonl(REMOVE_SERVER);
+    net_buf_copy(reply, (char*)&rpc_type, sizeof(uint32_t));
+
+    struct Server *srv = arg;
+
+    // TODO: better to use fixed-length ip string, ie
+    //       standard IP format, say, 127.000.000.001
+
+    /*
+     * ip_len | ip_str | port | id
+     */
+
+    // encode server ip
+    int ip_len = strlen(srv->host);
+    int _ip_len = htonl(ip_len);
+    net_buf_copy(reply, (char*)&_ip_len, sizeof(uint32_t));
+    net_buf_copy(reply, srv->host, ip_len);
+
+    // encode server port
+    int port = htonl(srv->port);
+    net_buf_copy(reply, (char*)&port, sizeof(uint32_t));
+
+    // encode server id
+    int id = htonl(srv->id);
+    net_buf_copy(reply, (char*)&id, sizeof(uint32_t));
+
+    list_append(&c->outbuf, &reply->node);
     net_connection_send(c);
 }
 

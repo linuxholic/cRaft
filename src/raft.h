@@ -1,6 +1,7 @@
 #ifndef _RAFT_H_
 #define _RAFT_H_
 
+#include "hash.h"
 #include "net.h"
 
 enum raft_server_state
@@ -10,10 +11,19 @@ enum raft_server_state
     CANDIDATE
 };
 
+enum raft_rpc_type
+{
+    REQUEST_VOTE = 1
+    , APPEND_ENTRIES
+    , ADD_SERVER
+    , REMOVE_SERVER
+};
+
 struct raft_server
 {
     net_timer_t            *heartbeat_timer;
     net_timer_t            *election_timer;
+    int                     election_timer_rnd;
     net_server_t           *tcp_server;
     struct raft_cluster    *cluster;
     enum raft_server_state  state;
@@ -31,9 +41,9 @@ struct raft_server
 
     /* AppendEntries RPC */
     int prevLogIndex;
-    int *nextIndex;
-    int *matchIndex;
-    int *inFlight;
+    struct hashTable *nextIndex_ht;
+    struct hashTable *matchIndex_ht;
+    struct hashTable *inFlight_ht;
     int prevLogTerm;
 
     int log_fd;

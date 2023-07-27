@@ -216,5 +216,6 @@ void net_timer_start(net_timer_t *, timer_handler, void *);
 void* net_timer_data(net_timer_t *timer);
 void net_timer_stop(net_timer_t *timer);
 void net_timer_reset(net_timer_t *timer, int value, int interval);
+int net_timer_remain(net_timer_t *timer);
 
 #endif // _NET_H_

@@ -7,8 +7,6 @@
 #include <string.h>
 #include <errno.h>
 
-#include "net.h"
-#include "hash.h"
 #include "raft.h"
 #include "raft-log.h"
 
@@ -31,14 +29,6 @@ struct raft_cluster
 {
     int number;
     struct raft_peer *peers;
-};
-
-enum raft_rpc_type
-{
-    REQUEST_VOTE = 1
-    , APPEND_ENTRIES
-    , ADD_SERVER
-    , REMOVE_SERVER
 };
 
 struct kv_server
@@ -66,7 +56,7 @@ char *kv_get(struct kv_server *svr, char *key)
     return hashGet(svr->map, key);
 }
 
-#define ElecttionTimeout 100 // ms
+#define MinimumElecttionTimeout 10 // seconds
 
 char* raft_state(int s)
 {
@@ -91,11 +81,12 @@ char* raft_state(int s)
 
 // TODO: move random time to election, so we can reduce random() calls
 // we only need to call random() when a real election occurs.
-int random_ElecttionTimeout(void)
+int random_ElecttionTimeout(int *rnd)
 {
     // TODO: align to paper's suggested value
-    int timeout = 10 + random() % 10;
+    int timeout = MinimumElecttionTimeout + random() % 10;
     loginfo("random ElecttionTimeout (in seconds): %d\n", timeout);
+    *rnd = timeout - MinimumElecttionTimeout;
     return timeout;
 }
 
@@ -129,6 +120,15 @@ void RequestVote_receiver(net_connect_t *c, uint32_t *res)
             "lastLogIndex(%u), lastLogTerm(%u)\n",
             raft_state(rs->state), term, candidateId,
             lastLogIndex, lastLogTerm);
+
+    // TODO: check minimum election timeout
+    int remain = net_timer_remain(rs->election_timer);
+    if (remain > rs->election_timer_rnd)
+    {
+        loginfo("recv RequestVote RPC within MinimumElecttionTimeout(%d), "
+                "ignore it.\n", MinimumElecttionTimeout);
+        return;
+    }
 
     if (rs->currentTerm > term)
     {
@@ -179,7 +179,7 @@ void RequestVote_receiver(net_connect_t *c, uint32_t *res)
                 rs->votedFor = candidateId;
                 raft_persist_votedFor(rs);
                 net_timer_reset(rs->election_timer,
-                        random_ElecttionTimeout(), 0);
+                        random_ElecttionTimeout(&rs->election_timer_rnd), 0);
             }
         }
         else {
@@ -301,6 +301,28 @@ int parse_log_entry_type(struct raft_log_entry *e)
     return ntohl(buf[0]);
 }
 
+void raft_rebuild_array(struct raft_server *rs, int id)
+{
+    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, id);
+    if (nextIndexPtr == NULL)
+    {
+        nextIndexPtr = malloc(sizeof(int));
+        hashPutInt(rs->nextIndex_ht, id, nextIndexPtr);
+    }
+    int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, id);
+    if (matchIndexPtr == NULL)
+    {
+        matchIndexPtr = malloc(sizeof(int));
+        hashPutInt(rs->matchIndex_ht, id, matchIndexPtr);
+    }
+    int *inFlightPtr = hashGetInt(rs->inFlight_ht, id);
+    if (inFlightPtr == NULL)
+    {
+        inFlightPtr = malloc(sizeof(int));
+        hashPutInt(rs->inFlight_ht, id, inFlightPtr);
+    }
+}
+
 /*
  * configuration entry format:
  * addr_num | ip_len | ip_str | port | id
@@ -340,6 +362,7 @@ void raft_apply_membership_change(
         rc->peers[i].port = port;
 
         int id = ntohl(*(uint32_t*)cur);
+        raft_rebuild_array(rs, id);
         cur += sizeof(uint32_t);
 
         rc->peers[i].id = id;
@@ -450,14 +473,15 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
                 loginfo("log term not match\n");
                 _AppendEntries_receiver(c, rs->currentTerm, 0);
                 net_timer_reset(rs->election_timer,
-                        random_ElecttionTimeout(), 0);
+                        random_ElecttionTimeout(&rs->election_timer_rnd), 0);
                 return;
             }
         }
         else {
             loginfo("log index not match\n");
             _AppendEntries_receiver(c, rs->currentTerm, 0);
-            net_timer_reset(rs->election_timer, random_ElecttionTimeout(), 0);
+            net_timer_reset(rs->election_timer,
+                    random_ElecttionTimeout(&rs->election_timer_rnd), 0);
             return;
         }
 
@@ -488,7 +512,8 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
         }
 
         _AppendEntries_receiver(c, rs->currentTerm, 1);
-        net_timer_reset(rs->election_timer, random_ElecttionTimeout(), 0);
+        net_timer_reset(rs->election_timer,
+                random_ElecttionTimeout(&rs->election_timer_rnd), 0);
     }
 
     uint32_t leaderCommit = ntohl(*(uint32_t*)cur);
@@ -581,10 +606,11 @@ void raft_try_commit(struct raft_server *rs, int index)
     int majority = 0;
     for (int i = 0; i < rs->cluster->number; i++)
     {
+        int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, i);
         loginfo("matchIndex[%d]: %d,  try commit index: %d.\n",
-                i, rs->matchIndex[i], index);
+                i, *matchIndexPtr, index);
 
-        if (rs->matchIndex[i] >= index)
+        if (*matchIndexPtr >= index)
         {
             majority++;
         }
@@ -649,10 +675,13 @@ int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
     int peer_id = raft_get_id(c->client->peer_host, c->client->peer_port);
     if (success)
     {
-        if (rs->inFlight[peer_id] > 0)
+        int *inFlightPtr = hashGetInt(rs->inFlight_ht, peer_id);
+        if (*inFlightPtr > 0)
         {
-            rs->nextIndex[peer_id] += rs->inFlight[peer_id];
-            rs->matchIndex[peer_id] = rs->nextIndex[peer_id]- 1;
+            int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, peer_id);
+            *nextIndexPtr += *inFlightPtr;
+            int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, peer_id);
+            *matchIndexPtr = *nextIndexPtr - 1;
             raft_commit(rs);
         }
     }
@@ -670,7 +699,8 @@ int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
         }
 
         // log consistency check failed, so decrease nextIndex
-        rs->nextIndex[peer_id] -= 1;
+        int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, peer_id);
+        *nextIndexPtr = *nextIndexPtr - 1;
     }
 
     net_connection_set_close(c); // non-keepalive
@@ -702,7 +732,8 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
     uint32_t leaderId = htonl(rs->id);
     net_buf_copy(reply, (char*)&leaderId, sizeof(uint32_t));
 
-    uint32_t _prevLogIndex = rs->nextIndex[peer_id] - 1;
+    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, peer_id);
+    uint32_t _prevLogIndex = *nextIndexPtr - 1;
     uint32_t prevLogIndex = htonl(_prevLogIndex);
     net_buf_copy(reply, (char*)&prevLogIndex, sizeof(uint32_t));
 
@@ -721,25 +752,26 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
 
     // TODO: multi log entries
     struct raft_log_entry *entries = c->client->user_data;
+    int *inFlightPtr = hashGetInt(rs->inFlight_ht, peer_id);
     if (entries)
     {
-        rs->inFlight[peer_id] = 1;
+        *inFlightPtr = 1;
     }
     else {
         if (_prevLogIndex < rs->lastLogIndex) // lagging follower
         {
             entries = &rs->entries[_prevLogIndex];
-            rs->inFlight[peer_id] = 1;
+            *inFlightPtr = 1;
         }
         else { // heartbeat
-            rs->inFlight[peer_id] = 0;
+            *inFlightPtr = 0;
         }
     }
 
-    uint32_t _num = htonl(rs->inFlight[peer_id]);
+    uint32_t _num = htonl(*inFlightPtr);
     net_buf_copy(reply, (char*)&_num, sizeof(uint32_t));
 
-    for (int i = 0; i < rs->inFlight[peer_id]; i++)
+    for (int i = 0; i < *inFlightPtr; i++)
     {
         uint32_t len = htonl(entries[i].cmd.len);
         net_buf_copy(reply, (char*)&len, sizeof(uint32_t));
@@ -756,7 +788,7 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
             "prevLogIndex(%d), prevLogTerm(%d), logEntries[%d], "
             "leaderCommit(%d)\n", raft_state(rs->state),
             rs->currentTerm, rs->id, _prevLogIndex,
-            _prevLogTerm, rs->inFlight[peer_id], rs->commitIndex);
+            _prevLogTerm, *inFlightPtr, rs->commitIndex);
 
     // send to wire
     list_append(&c->outbuf, &reply->node);
@@ -802,8 +834,10 @@ void raft_log_replication(struct raft_server *rs,
 {
     raft_persist_log(rs, entry);
 
-    rs->nextIndex[rs->id]++;
-    rs->matchIndex[rs->id] = rs->lastLogIndex;
+    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, rs->id);
+    *nextIndexPtr = *nextIndexPtr + 1;
+    int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, rs->id);
+    *matchIndexPtr = rs->lastLogIndex;
 
     // replicate log entry to peers
     for (int i = 0; i < rs->cluster->number; i++)
@@ -869,6 +903,7 @@ void AddServer_receiver(net_connect_t *c, uint32_t *res)
      * 1. rebuild raft cluster
      * 2. rebuild nextIndex[]
      * 3. rebuild matchIndex[]
+     * 4. rebuild inFlight[]
      */
 
     struct raft_cluster *rc = rs->cluster;
@@ -878,11 +913,124 @@ void AddServer_receiver(net_connect_t *c, uint32_t *res)
     rc->peers[rc->number - 1].port = server_port;
     rc->peers[rc->number - 1].id = server_id;
 
-    rs->nextIndex = realloc(rs->nextIndex, sizeof(int) * rc->number);
-    rs->nextIndex[rc->number - 1] = rs->lastLogIndex + 1;
+    int *nextIndexPtr = malloc(sizeof(int));
+    hashPutInt(rs->nextIndex_ht, server_id, nextIndexPtr);
+    int *matchIndexPtr = malloc(sizeof(int));
+    hashPutInt(rs->matchIndex_ht, server_id, matchIndexPtr);
+    int *inFlightPtr = malloc(sizeof(int));
+    hashPutInt(rs->inFlight_ht, server_id, inFlightPtr);
 
-    rs->matchIndex = realloc(rs->matchIndex, sizeof(int) * rc->number);
-    rs->matchIndex[rc->number - 1] = 0;
+    // only leader need to init these newly added item
+    *nextIndexPtr = rs->lastLogIndex + 1;
+    *matchIndexPtr = 0;
+    // *inFlightPtr is just a container, no need to initialize
+
+    /*
+     * fill command buffer (encoding) and refer to
+     * raft_apply_membership_change for decoding
+     */
+
+    int buf_len = (sizeof(uint32_t)    // cmd type
+                 + sizeof(uint32_t));; // addr num
+    void *buf = malloc(buf_len);
+
+    int cmd_type = htonl(3); // per membership change
+    memcpy(buf, &cmd_type, sizeof(uint32_t));
+
+    int addr_num = htonl(rc->number);
+    memcpy(buf + sizeof(uint32_t), &addr_num, sizeof(uint32_t));
+
+    for (int i = 0; i < rc->number; i++)
+    {
+        int prev_len = buf_len;
+
+        ip_len = strlen(rc->peers[i].addr);
+        buf_len += sizeof(uint32_t)    // ip len
+                   + ip_len            // ip
+                   + sizeof(uint32_t)  // port
+                   + sizeof(uint32_t); // id
+
+        buf = realloc(buf, buf_len);
+        cur = buf + prev_len;
+
+        uint32_t _ip_len = htonl(ip_len);
+        memcpy(cur, &_ip_len, sizeof(uint32_t));
+        cur += sizeof(uint32_t);
+
+        memcpy(cur, rc->peers[i].addr, ip_len);
+        cur += ip_len;
+
+        server_port = htonl(rc->peers[i].port);
+        memcpy(cur, &server_port, sizeof(uint32_t));
+        cur += sizeof(uint32_t);
+
+        server_id = htonl(rc->peers[i].id);
+        memcpy(cur, &server_id, sizeof(uint32_t));
+        cur += sizeof(uint32_t);
+    }
+
+    struct raft_log_entry *e = raft_fill_configuration_entry(rs, buf, buf_len);
+    raft_log_replication(rs, e);
+    raft_commit_callback(e, AddServer_response, c);
+}
+
+void RemoveServer_receiver(net_connect_t *c, uint32_t *res)
+{
+    uint8_t *cur = (uint8_t*)(res + 1); // skip raft rpc type
+    struct raft_server *rs = c->data;
+
+    uint32_t ip_len = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    char *server_ip = strndup((char*)cur, ip_len);
+    cur += ip_len;
+
+    uint32_t server_port = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    uint32_t server_id = ntohl(*(uint32_t*)cur);
+    cur += sizeof(uint32_t);
+
+    loginfo("[%s] recv RemoveServer RPC: %.*s:%d(%d)\n",
+            raft_state(rs->state),
+            ip_len, server_ip, server_port, server_id);
+
+    /*
+     * TODO:
+     * 1. Reply NOT_LEADER if not leader
+     * 2. Wait until previous configuration entry is commited
+     */
+
+    /*
+     * 1. rebuild raft cluster
+     * 2. rebuild nextIndex[]
+     * 3. rebuild matchIndex[]
+     * 4. rebuild inFlight[]
+     */
+
+    struct raft_cluster *rc = rs->cluster;
+    for (int i = 0; i < rc->number; i++)
+    {
+        if (rc->peers[i].id == server_id)
+        {
+            rc->peers[i].id = rc->peers[rc->number - 1].id;
+            rc->peers[i].port = rc->peers[rc->number - 1].port;
+            free(rc->peers[i].addr);
+            rc->peers[i].addr = rc->peers[rc->number - 1].addr;
+        }
+    }
+    rc->number--;
+    rc->peers = realloc(rc->peers, sizeof(struct raft_peer) * rc->number);
+
+    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, server_id);
+    hashDeleteInt(rs->nextIndex_ht, server_id);
+    free(nextIndexPtr);
+    int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, server_id);
+    hashDeleteInt(rs->matchIndex_ht, server_id);
+    free(matchIndexPtr);
+    int *inFlightPtr = hashGetInt(rs->inFlight_ht, server_id);
+    hashDeleteInt(rs->inFlight_ht, server_id);
+    free(inFlightPtr);
 
     /*
      * fill command buffer (encoding) and refer to
@@ -1041,6 +1189,16 @@ int raft_leader(char *start, int size, net_connect_t *c)
             AddServer_receiver(c, res);
             break;
 
+        case REMOVE_SERVER:
+            if (size < 25)
+            {
+                loginfo("RemoveServer RPC: partial results.\n");
+                return 0;
+            }
+            RemoveServer_receiver(c, res);
+            break;
+
+
         default:
             logerr("raft leader recv unknown rpc type: %u\n", rpc_type);
             break;
@@ -1098,7 +1256,10 @@ void raft_reset_nextIndex(struct raft_server *rs)
 {
     for (int i = 0; i < rs->cluster->number; i++)
     {
-        rs->nextIndex[i] = rs->lastLogIndex + 1;
+        int id = raft_get_id(rs->cluster->peers[i].addr,
+                             rs->cluster->peers[i].port);
+        int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, id);
+        *nextIndexPtr = rs->lastLogIndex + 1;
     }
 }
 
@@ -1106,12 +1267,15 @@ void raft_reset_matchIndex(struct raft_server *rs)
 {
     for (int i = 0; i < rs->cluster->number; i++)
     {
+        int id = raft_get_id(rs->cluster->peers[i].addr,
+                             rs->cluster->peers[i].port);
+        int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, id);
         if (rs->id == i)
         {
-            rs->matchIndex[i] = rs->lastLogIndex;
+            *matchIndexPtr = rs->lastLogIndex;
         }
         else {
-            rs->matchIndex[i] = 0;
+            *matchIndexPtr = 0;
         }
     }
 }
@@ -1282,7 +1446,8 @@ void start_election(net_timer_t *election_timer)
     }
 
     // in case of split votes
-    net_timer_reset(election_timer, random_ElecttionTimeout(), 0);
+    net_timer_reset(election_timer,
+            random_ElecttionTimeout(&rs->election_timer_rnd), 0);
 }
 
 void bind_raft_server(net_connect_t *c, void *arg)
@@ -1369,8 +1534,8 @@ void raft_server_stop(net_loop_t *loop, void *arg)
 
     struct raft_server *rs = kvs->rs;
     raft_free_cluster(rs->cluster);
-    free(rs->nextIndex);
-    free(rs->matchIndex);
+    hashDestroy(rs->nextIndex_ht); // TODO: free int* space
+    hashDestroy(rs->matchIndex_ht); // TODO: free int* space
     close(rs->log_fd);
     free(rs);
 }
@@ -1441,6 +1606,10 @@ int main(int argc, char *argv[])
     net_server_set_accept_callback(app_server, bind_kv_server, kvs);
     rs->st = kvs;
 
+    rs->nextIndex_ht = hashInit(3);
+    rs->matchIndex_ht = hashInit(3);
+    rs->inFlight_ht = hashInit(3);
+
     rs->cluster = calloc(1, sizeof(struct raft_cluster));
     if (init)
     {
@@ -1449,15 +1618,9 @@ int main(int argc, char *argv[])
         raft_apply(rs, rs->lastApplied);
     }
 
-    rs->nextIndex = malloc(sizeof(int) * rs->cluster->number);
-    // raft_reset_nextIndex(rs);
-    rs->matchIndex = malloc(sizeof(int) * rs->cluster->number);
-    // raft_reset_matchIndex(rs);
-
-    rs->inFlight = calloc(rs->cluster->number, sizeof(int));
-
     srandom(time(NULL) + node_id);
-    net_timer_t *timer = net_timer_init(loop, random_ElecttionTimeout(), 0);
+    net_timer_t *timer = net_timer_init(loop,
+            random_ElecttionTimeout(&rs->election_timer_rnd), 0);
     net_timer_start(timer, start_election, rs);
     rs->election_timer = timer;
     rs->heartbeat_timer = NULL;

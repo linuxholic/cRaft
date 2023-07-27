@@ -1045,6 +1045,17 @@ void net_timer_reset(net_timer_t *timer, int value, int interval)
 }
 
 
+int net_timer_remain(net_timer_t *timer)
+{
+    struct itimerspec curr;
+    if (timerfd_gettime(timer->timer_fd, &curr))
+    {
+        perror("timer remain: timerfd_gettime failed");
+    }
+    return curr.it_value.tv_sec;
+}
+
+
 void net_timer_trigger(net_io_t *w)
 {
     ssize_t ret;

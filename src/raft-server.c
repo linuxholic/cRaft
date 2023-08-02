@@ -16,21 +16,6 @@ struct kv_raft_ctx
     struct kv_cmd *cmd;
 };
 
-struct raft_peer
-{
-    char *addr;
-    int port;
-
-    // TODO: use hash table to bind id and peer
-    int id;
-};
-
-struct raft_cluster
-{
-    int number;
-    struct raft_peer *peers;
-};
-
 struct kv_server
 {
     struct hashTable *map;
@@ -301,28 +286,6 @@ int parse_log_entry_type(struct raft_log_entry *e)
     return ntohl(buf[0]);
 }
 
-void raft_rebuild_array(struct raft_server *rs, int id)
-{
-    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, id);
-    if (nextIndexPtr == NULL)
-    {
-        nextIndexPtr = malloc(sizeof(int));
-        hashPutInt(rs->nextIndex_ht, id, nextIndexPtr);
-    }
-    int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, id);
-    if (matchIndexPtr == NULL)
-    {
-        matchIndexPtr = malloc(sizeof(int));
-        hashPutInt(rs->matchIndex_ht, id, matchIndexPtr);
-    }
-    int *inFlightPtr = hashGetInt(rs->inFlight_ht, id);
-    if (inFlightPtr == NULL)
-    {
-        inFlightPtr = malloc(sizeof(int));
-        hashPutInt(rs->inFlight_ht, id, inFlightPtr);
-    }
-}
-
 /*
  * configuration entry format:
  * addr_num | ip_len | ip_str | port | id
@@ -362,7 +325,6 @@ void raft_apply_membership_change(
         rc->peers[i].port = port;
 
         int id = ntohl(*(uint32_t*)cur);
-        raft_rebuild_array(rs, id);
         cur += sizeof(uint32_t);
 
         rc->peers[i].id = id;
@@ -576,11 +538,6 @@ struct raft_log_entry *raft_fill_configuration_entry(struct raft_server *rs,
     return entry;
 }
 
-int raft_get_id(char *host, int port)
-{
-    return port - 7777;
-}
-
 void raft_on_commit(struct raft_server *rs, int index)
 {
     struct raft_log_entry *e = &rs->entries[index - 1];
@@ -606,11 +563,11 @@ void raft_try_commit(struct raft_server *rs, int index)
     int majority = 0;
     for (int i = 0; i < rs->cluster->number; i++)
     {
-        int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, i);
+        int matchIndex = rs->cluster->peers[i].matchIndex;
         loginfo("matchIndex[%d]: %d,  try commit index: %d.\n",
-                i, *matchIndexPtr, index);
+                i, matchIndex, index);
 
-        if (*matchIndexPtr >= index)
+        if (matchIndex >= index)
         {
             majority++;
         }
@@ -655,6 +612,20 @@ void raft_commit(struct raft_server *rs)
     }
 }
 
+struct raft_peer* raft_get_peer(struct raft_cluster* rc, char *addr, int port)
+{
+    struct raft_peer *peer = NULL;
+    for (int i = 0; i < rc->number; i++)
+    {
+        peer = &rc->peers[i];
+        if (peer->port == port
+            && strcmp(peer->addr, addr) == 0)
+        {
+            break;
+        }
+    }
+    return peer;
+}
 
 int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
 {
@@ -672,16 +643,15 @@ int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
             "term(%u), success(%u).\n",
             raft_state(rs->state), term, success);
 
-    int peer_id = raft_get_id(c->client->peer_host, c->client->peer_port);
+    struct raft_peer *peer = raft_get_peer(rs->cluster,
+                             c->client->peer_host, c->client->peer_port);
+
     if (success)
     {
-        int *inFlightPtr = hashGetInt(rs->inFlight_ht, peer_id);
-        if (*inFlightPtr > 0)
+        if (peer->inFlight > 0)
         {
-            int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, peer_id);
-            *nextIndexPtr += *inFlightPtr;
-            int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, peer_id);
-            *matchIndexPtr = *nextIndexPtr - 1;
+            peer->nextIndex += peer->inFlight;
+            peer->matchIndex = peer->nextIndex - 1;
             raft_commit(rs);
         }
     }
@@ -699,8 +669,7 @@ int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
         }
 
         // log consistency check failed, so decrease nextIndex
-        int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, peer_id);
-        *nextIndexPtr = *nextIndexPtr - 1;
+        peer->nextIndex--;
     }
 
     net_connection_set_close(c); // non-keepalive
@@ -709,15 +678,14 @@ int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
 
 void __AppendEntries_invoke(net_connect_t *c, void *arg)
 {
-    int peer_id = raft_get_id(c->client->peer_host,
-                              c->client->peer_port);
     struct raft_server *rs = arg;
-
+    struct raft_peer *peer = raft_get_peer(rs->cluster,
+                             c->client->peer_host, c->client->peer_port);
     if (c->err)
     {
         loginfo("[%s] send AppendEntries RPC to node(%d): "
                 "failed to connect.\n",
-                raft_state(rs->state), peer_id);
+                raft_state(rs->state), peer->id);
         return;
     }
 
@@ -732,8 +700,7 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
     uint32_t leaderId = htonl(rs->id);
     net_buf_copy(reply, (char*)&leaderId, sizeof(uint32_t));
 
-    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, peer_id);
-    uint32_t _prevLogIndex = *nextIndexPtr - 1;
+    uint32_t _prevLogIndex = peer->nextIndex - 1;
     uint32_t prevLogIndex = htonl(_prevLogIndex);
     net_buf_copy(reply, (char*)&prevLogIndex, sizeof(uint32_t));
 
@@ -752,26 +719,25 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
 
     // TODO: multi log entries
     struct raft_log_entry *entries = c->client->user_data;
-    int *inFlightPtr = hashGetInt(rs->inFlight_ht, peer_id);
     if (entries)
     {
-        *inFlightPtr = 1;
+        peer->inFlight = 1;
     }
     else {
         if (_prevLogIndex < rs->lastLogIndex) // lagging follower
         {
             entries = &rs->entries[_prevLogIndex];
-            *inFlightPtr = 1;
+            peer->inFlight = 1;
         }
         else { // heartbeat
-            *inFlightPtr = 0;
+            peer->inFlight = 0;
         }
     }
 
-    uint32_t _num = htonl(*inFlightPtr);
+    uint32_t _num = htonl(peer->inFlight);
     net_buf_copy(reply, (char*)&_num, sizeof(uint32_t));
 
-    for (int i = 0; i < *inFlightPtr; i++)
+    for (int i = 0; i < peer->inFlight; i++)
     {
         uint32_t len = htonl(entries[i].cmd.len);
         net_buf_copy(reply, (char*)&len, sizeof(uint32_t));
@@ -788,7 +754,7 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
             "prevLogIndex(%d), prevLogTerm(%d), logEntries[%d], "
             "leaderCommit(%d)\n", raft_state(rs->state),
             rs->currentTerm, rs->id, _prevLogIndex,
-            _prevLogTerm, *inFlightPtr, rs->commitIndex);
+            _prevLogTerm, peer->inFlight, rs->commitIndex);
 
     // send to wire
     list_append(&c->outbuf, &reply->node);
@@ -834,10 +800,10 @@ void raft_log_replication(struct raft_server *rs,
 {
     raft_persist_log(rs, entry);
 
-    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, rs->id);
-    *nextIndexPtr = *nextIndexPtr + 1;
-    int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, rs->id);
-    *matchIndexPtr = rs->lastLogIndex;
+    struct raft_peer *self = raft_get_peer(rs->cluster,
+            rs->tcp_server->local_host, rs->tcp_server->local_port);
+    self->nextIndex++;
+    self->matchIndex = rs->lastLogIndex;
 
     // replicate log entry to peers
     for (int i = 0; i < rs->cluster->number; i++)
@@ -912,18 +878,9 @@ void AddServer_receiver(net_connect_t *c, uint32_t *res)
     rc->peers[rc->number - 1].addr = server_ip;
     rc->peers[rc->number - 1].port = server_port;
     rc->peers[rc->number - 1].id = server_id;
-
-    int *nextIndexPtr = malloc(sizeof(int));
-    hashPutInt(rs->nextIndex_ht, server_id, nextIndexPtr);
-    int *matchIndexPtr = malloc(sizeof(int));
-    hashPutInt(rs->matchIndex_ht, server_id, matchIndexPtr);
-    int *inFlightPtr = malloc(sizeof(int));
-    hashPutInt(rs->inFlight_ht, server_id, inFlightPtr);
-
-    // only leader need to init these newly added item
-    *nextIndexPtr = rs->lastLogIndex + 1;
-    *matchIndexPtr = 0;
-    // *inFlightPtr is just a container, no need to initialize
+    rc->peers[rc->number - 1].nextIndex = rs->lastLogIndex + 1;
+    rc->peers[rc->number - 1].matchIndex = 0;
+    rc->peers[rc->number - 1].inFlight = 0;
 
     /*
      * fill command buffer (encoding) and refer to
@@ -1013,24 +970,15 @@ void RemoveServer_receiver(net_connect_t *c, uint32_t *res)
     {
         if (rc->peers[i].id == server_id)
         {
-            rc->peers[i].id = rc->peers[rc->number - 1].id;
-            rc->peers[i].port = rc->peers[rc->number - 1].port;
             free(rc->peers[i].addr);
-            rc->peers[i].addr = rc->peers[rc->number - 1].addr;
+            memcpy(&rc->peers[i],
+                   &rc->peers[rc->number - 1],
+                   sizeof(struct raft_peer));
+            break;
         }
     }
     rc->number--;
     rc->peers = realloc(rc->peers, sizeof(struct raft_peer) * rc->number);
-
-    int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, server_id);
-    hashDeleteInt(rs->nextIndex_ht, server_id);
-    free(nextIndexPtr);
-    int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, server_id);
-    hashDeleteInt(rs->matchIndex_ht, server_id);
-    free(matchIndexPtr);
-    int *inFlightPtr = hashGetInt(rs->inFlight_ht, server_id);
-    hashDeleteInt(rs->inFlight_ht, server_id);
-    free(inFlightPtr);
 
     /*
      * fill command buffer (encoding) and refer to
@@ -1256,10 +1204,7 @@ void raft_reset_nextIndex(struct raft_server *rs)
 {
     for (int i = 0; i < rs->cluster->number; i++)
     {
-        int id = raft_get_id(rs->cluster->peers[i].addr,
-                             rs->cluster->peers[i].port);
-        int *nextIndexPtr = hashGetInt(rs->nextIndex_ht, id);
-        *nextIndexPtr = rs->lastLogIndex + 1;
+        rs->cluster->peers[i].nextIndex = rs->lastLogIndex + 1;
     }
 }
 
@@ -1267,15 +1212,12 @@ void raft_reset_matchIndex(struct raft_server *rs)
 {
     for (int i = 0; i < rs->cluster->number; i++)
     {
-        int id = raft_get_id(rs->cluster->peers[i].addr,
-                             rs->cluster->peers[i].port);
-        int *matchIndexPtr = hashGetInt(rs->matchIndex_ht, id);
-        if (rs->id == i)
+        if (i == rs->id)
         {
-            *matchIndexPtr = rs->lastLogIndex;
+            rs->cluster->peers[i].matchIndex = rs->lastLogIndex;
         }
         else {
-            *matchIndexPtr = 0;
+            rs->cluster->peers[i].matchIndex = 0;
         }
     }
 }
@@ -1518,6 +1460,7 @@ int client_request(char *start, size_t size, net_connect_t *c)
 
 void raft_free_cluster(struct raft_cluster *rc)
 {
+    // To be honest, I kinda miss the destructor function in C++.
     for (int i = 0; i < rc->number; i++)
     {
         free(rc->peers[i].addr);
@@ -1534,8 +1477,6 @@ void raft_server_stop(net_loop_t *loop, void *arg)
 
     struct raft_server *rs = kvs->rs;
     raft_free_cluster(rs->cluster);
-    hashDestroy(rs->nextIndex_ht); // TODO: free int* space
-    hashDestroy(rs->matchIndex_ht); // TODO: free int* space
     close(rs->log_fd);
     free(rs);
 }
@@ -1605,10 +1546,6 @@ int main(int argc, char *argv[])
     kvs->map = hashInit(1024);
     net_server_set_accept_callback(app_server, bind_kv_server, kvs);
     rs->st = kvs;
-
-    rs->nextIndex_ht = hashInit(3);
-    rs->matchIndex_ht = hashInit(3);
-    rs->inFlight_ht = hashInit(3);
 
     rs->cluster = calloc(1, sizeof(struct raft_cluster));
     if (init)

@@ -4,11 +4,27 @@
 #include "hash.h"
 #include "net.h"
 
+struct raft_peer
+{
+    char *addr;
+    int   port;
+    int   id;
+    int   nextIndex;
+    int   matchIndex;
+    int   inFlight;
+};
+
+struct raft_cluster
+{
+    int number;
+    struct raft_peer *peers;
+};
+
 enum raft_server_state
 {
-    LEADER = 1,
-    FOLLOWER,
-    CANDIDATE
+    LEADER = 1
+    , FOLLOWER
+    , CANDIDATE
 };
 
 enum raft_rpc_type
@@ -41,9 +57,6 @@ struct raft_server
 
     /* AppendEntries RPC */
     int prevLogIndex;
-    struct hashTable *nextIndex_ht;
-    struct hashTable *matchIndex_ht;
-    struct hashTable *inFlight_ht;
     int prevLogTerm;
 
     int log_fd;

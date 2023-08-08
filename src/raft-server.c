@@ -106,7 +106,6 @@ void RequestVote_receiver(net_connect_t *c, uint32_t *res)
             raft_state(rs->state), term, candidateId,
             lastLogIndex, lastLogTerm);
 
-    // TODO: check minimum election timeout
     int remain = net_timer_remain(rs->election_timer);
     if (remain > rs->election_timer_rnd)
     {
@@ -192,7 +191,7 @@ void _AppendEntries_receiver(net_connect_t *c, int term, int success)
     net_connection_send(c);
 }
 
-// TODO:
+// TODO
 // associate state machine command with raft log entry, so
 // we can parse command byte steam just once, then reuse
 // the, ie kv cmd, structure afterwards.(we can retain these
@@ -394,6 +393,7 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
         {
             loginfo("[%s] node(%d) update term: %d -> %d.\n",
                     raft_state(rs->state), rs->id, rs->currentTerm, term);
+
             rs->currentTerm = term;
             raft_persist_currentTerm(rs);
             rs->votedFor = -1;
@@ -411,9 +411,8 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
             // another candidate get majority votes within same term
             if (rs->state == CANDIDATE)
             {
-                loginfo("node(%d) convert state: %s -> %s.\n", rs->id,
-                        raft_state(rs->state), raft_state(FOLLOWER));
                 rs->state = FOLLOWER;
+                loginfo("raft candidate: convert to follower.\n");
             }
             else {
                 // normal log replication
@@ -656,20 +655,29 @@ int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
         }
     }
     else {
+        // whenever see larger term, update local currentTerm
         if (term > rs->currentTerm)
         {
+            // pause heartbeat to peers
+            net_timer_reset(rs->heartbeat_timer, 0, 0);
+
+            loginfo("[%s] node(%d) update term: %d -> %d.\n",
+                    raft_state(rs->state), rs->id, rs->currentTerm, term);
+
             rs->currentTerm = term;
             raft_persist_currentTerm(rs);
+            rs->votedFor = -1;
+            raft_persist_votedFor(rs);
 
             rs->state = FOLLOWER;
             loginfo("raft leader: convert to follower.\n");
-
-            // pause heartbeat to peers
-            net_timer_reset(rs->heartbeat_timer, 0, 0);
+            net_timer_reset(rs->election_timer,
+                    random_ElecttionTimeout(&rs->election_timer_rnd), 0);
         }
-
-        // log consistency check failed, so decrease nextIndex
-        peer->nextIndex--;
+        else {
+            // log consistency check failed, so decrease nextIndex
+            peer->nextIndex--;
+        }
     }
 
     net_connection_set_close(c); // non-keepalive
@@ -1047,7 +1055,7 @@ int raft_follower(char *start, size_t size, net_connect_t *c)
             break;
 
         case APPEND_ENTRIES:
-            if (size < 28) // TODO: non-empty AppendEntries RPC
+            if (size < 28) // TODO: multiple log entries
             {
                 loginfo("AppendEntries RPC: partial results.\n");
                 return 0;
@@ -1082,7 +1090,7 @@ int raft_candidate(char *start, int size, net_connect_t *c)
             break;
 
         case APPEND_ENTRIES:
-            if (size < 28) // TODO: non-empty AppendEntries RPC
+            if (size < 28) // TODO: multiple log entries
             {
                 loginfo("AppendEntries RPC: partial results.\n");
                 return 0;
@@ -1107,11 +1115,6 @@ int raft_leader(char *start, int size, net_connect_t *c)
     switch (rpc_type)
     {
         case REQUEST_VOTE:
-            // TODO: MAYBE convert to follower, it depends.
-            //
-            // if one follower can't recv packets while it can
-            // send out packets, then leader should not step down.
-            //
             // if there is a STABLE leader arcoss the whole
             // cluster, then RequestVote with bigger term should
             // be ignored, which is also the situation when changing
@@ -1120,7 +1123,7 @@ int raft_leader(char *start, int size, net_connect_t *c)
             break;
 
         case APPEND_ENTRIES:
-            if (size < 28) // TODO: non-empty AppendEntries RPC
+            if (size < 28) // TODO: multiple log entries
             {
                 loginfo("AppendEntries RPC: partial results.\n");
                 return 0;
@@ -1288,12 +1291,21 @@ int __RequestVote_invoke(char *start, size_t size, net_connect_t *c)
         }
     }
     else {
+        // whenever see larger term, update local currentTerm
         if (term > rs->currentTerm)
         {
+            loginfo("[%s] node(%d) update term: %d -> %d.\n",
+                    raft_state(rs->state), rs->id, rs->currentTerm, term);
+
             rs->currentTerm = term;
             raft_persist_currentTerm(rs);
+            rs->votedFor = -1;
+            raft_persist_votedFor(rs);
+
             rs->state = FOLLOWER;
             loginfo("raft candidate: convert to follower.\n");
+            net_timer_reset(rs->election_timer,
+                    random_ElecttionTimeout(&rs->election_timer_rnd), 0);
         }
     }
 

@@ -128,6 +128,23 @@ int main(int argc, char *argv[])
 
     printf("currentTerm: %u, votedFor: %d\n", currentTerm, votedFor);
 
+    uint32_t discard_index;
+    if (read(fd, &discard_index, 4) == 0)
+    {
+        printf("fail to read discard_index in '%s'\n", path);
+        exit(EXIT_FAILURE);
+    }
+
+    int discard_term;
+    if (read(fd, &discard_term, 4) == 0)
+    {
+        printf("fail to read discard_term in '%s'\n", path);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("discard_index: %u, discard_term: %d\n",
+            discard_index, discard_term);
+
     int index = 1;
     int term;
     while(read(fd, &term, 4))

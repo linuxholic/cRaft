@@ -1,6 +1,8 @@
 #ifndef _RAFT_H_
 #define _RAFT_H_
 
+#include <stdio.h> // FILE
+
 #include "hash.h"
 #include "net.h"
 
@@ -59,8 +61,11 @@ struct raft_server
     int prevLogIndex;
     int prevLogTerm;
 
-    int log_fd;
+    FILE *log_handler;
+    char *log_path;
     struct raft_log_entry *entries;
+    int discard_index;
+    int discard_term;
 
     void *st; // state machine
 };

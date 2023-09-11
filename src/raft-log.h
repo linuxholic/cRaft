@@ -31,11 +31,35 @@ struct raft_log_entry
     void *cb_arg;
 };
 
+/*
+ * 1. raft log layout
+ *
+ * currentTerm | votedFor | index | term
+ * regualr entry | regular entry | ...
+ * regualr entry | regular entry | ...
+ * regualr entry | regular entry | ...
+ *
+ * 1.1 raft log entry layout
+ *
+ * term | cmd_len | cmd_type | cmd_bytes
+ *
+ * cmd_len includes cmd_type and cmd_bytes
+ *
+ * 1.1.1 raft config entry layout
+ *
+ * ip_num | ip_len | ip_str | port | id
+ *        | ip_len | ip_str | port | id
+ *        | ip_len | ip_str | port | id
+ * 
+ * corresponding to cmd_bytes
+ *
+ */
 void raft_init(char *path);
 void raft_persist_votedFor(struct raft_server *rs);
 void raft_persist_currentTerm(struct raft_server *rs);
 void raft_persist_log(struct raft_server *rs, struct raft_log_entry *entry);
 void raft_restore_log(struct raft_server *rs, char *path);
 void raft_log_delete(struct raft_server *rs, int idx);
+void raft_log_compaction(struct raft_server *rs);
 
 #endif // _RAFT_LOG_H_

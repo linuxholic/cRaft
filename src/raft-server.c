@@ -20,6 +20,7 @@ struct kv_server
 {
     struct hashTable *map;
     struct raft_server *rs;
+    char *snapshot_path;
 };
 
 struct kv_cmd
@@ -39,6 +40,138 @@ void kv_set(struct kv_server *svr, char *key, char *value)
 char *kv_get(struct kv_server *svr, char *key)
 {
     return hashGet(svr->map, key);
+}
+
+/*
+ * buckets_count | keys_count
+ * key_size | key | value_size | value
+ * key_size | key | value_size | value
+ * key_size | key | value_size | value
+ */
+void _kv_snapshot_store(struct kv_server *kvs, int fd)
+{
+    int buckets_count = kvs->map->size;
+    write(fd, &buckets_count, 4);
+
+    off_t pin = lseek(fd, 0, SEEK_CUR);
+    int keys_count = 0;
+    write(fd, &keys_count, 4);
+
+    for (int i = 0; i < buckets_count; i++)
+    {
+        struct hashItem *item = kvs->map->arr[i];
+        while (item)
+        {
+            char *key_str = item->key._str;
+            int key_size = strlen(key_str);
+            char *value_str = (char*)item->value;
+            int value_size = strlen(value_str);
+            write(fd, &key_size, 4);
+            write(fd, key_str, key_size);
+            write(fd, &value_size, 4);
+            write(fd, value_str, value_size);
+
+            keys_count++;
+            item = item->next;
+        }
+    }
+
+    // backpatching
+    lseek(fd, pin, SEEK_SET);
+    write(fd, &keys_count, 4);
+}
+
+void kv_snapshot_store(struct kv_server *kvs)
+{
+    struct stat buffer;
+    char *path = kvs->snapshot_path;
+    if (stat(path, &buffer) == 0)
+    {
+        remove(path);
+        logerr("remove old snapshot file.\n");
+    }
+    else {
+        if (errno == ENOENT)
+        {
+            logerr("create snapshot file.\n");
+        }
+        else {
+            logerr("stat snapshot file '%s' error: %s\n",
+                    path, strerror(errno));
+            return;
+        }
+    }
+
+    int fd = open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IROTH);
+    if (fd < 0)
+    {
+        logerr("failed to open snapshot file '%s': %s\n",
+                path, strerror(errno));
+        return;
+    }
+
+    _kv_snapshot_store(kvs, fd);
+    close(fd);
+}
+
+void _kv_snapshot_load(struct kv_server *kvs, int fd)
+{
+    int buckets_count;
+    read(fd, &buckets_count, 4);
+    kvs->map = hashInit(buckets_count);
+
+    int keys_count;
+    read(fd, &keys_count, 4);
+    for (int i = 0; i < keys_count; i++)
+    {
+        int key_size;
+        read(fd, &key_size, 4);
+        char *key = malloc(key_size + 1);
+        read(fd, key, key_size);
+        key[key_size - 1] = '\0';
+
+        int value_size;
+        read(fd, &value_size, 4);
+        char *value = malloc(value_size + 1);
+        read(fd, value, value_size);
+        value[value_size - 1] = '\0';
+
+        hashPut(kvs->map, key, value);
+    }
+
+}
+
+int kv_snapshot_load(struct kv_server *kvs)
+{
+    struct stat buffer;
+    char *path = kvs->snapshot_path;
+    if (stat(path, &buffer) == 0)
+    {
+        loginfo("loading snapshot file...\n");
+    }
+    else {
+        if (errno == ENOENT)
+        {
+            loginfo("no snapshot file, skip loading.\n");
+        }
+        else {
+            logerr("stat snapshot file '%s' error: %s\n",
+                    path, strerror(errno));
+        }
+        return 1;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+    {
+        logerr("failed to open snapshot file '%s': %s\n",
+                path, strerror(errno));
+        return 1;
+    }
+
+    _kv_snapshot_load(kvs, fd);
+    close(fd);
+    return 0;
 }
 
 #define MinimumElecttionTimeout 10 // seconds
@@ -251,6 +384,13 @@ struct kv_cmd* parse_cmd(uint8_t *stream)
     return cmd;
 }
 
+// TODO: this should be registered by state machine into raft, then raft
+// will call it when log entry is considered to be commited.
+// ie, raft_register_state_machine_apply_callback() API
+//
+// maybe better parameters:
+// * command buffer
+// * state machine ctx
 void raft_apply_state_machine(struct raft_server *rs, int index)
 {
     struct raft_log_entry *e = &rs->entries[index - 1];
@@ -277,6 +417,15 @@ void raft_apply_state_machine(struct raft_server *rs, int index)
                     index, cmd->type);
     }
     free(cmd);
+}
+
+void raft_snapshot(struct raft_server *rs)
+{
+    struct kv_server *kvs = rs->st;
+
+    // TODO: state machine register this as callback into raft
+    // rs->cbs.snapshot(rs->st)
+    kv_snapshot_store(kvs);
 }
 
 int parse_log_entry_type(struct raft_log_entry *e)
@@ -333,13 +482,6 @@ void raft_apply_membership_change(
     }
 }
 
-// TODO: this should be registered by state machine into raft, then raft
-// will call it when log entry is considered to be commited.
-// ie, raft_register_state_machine_apply_callback() API
-//
-// maybe better parameters:
-// * command buffer
-// * state machine ctx
 void raft_apply(struct raft_server *rs, int index)
 {
     struct raft_log_entry *e = &rs->entries[index - 1];
@@ -349,6 +491,8 @@ void raft_apply(struct raft_server *rs, int index)
     {
         case 1:
             raft_apply_state_machine(rs, index);
+            raft_snapshot(rs);
+            raft_log_compaction(rs);
             break;
         case 2:
             loginfo("apply no-op log entry.\n");
@@ -420,7 +564,8 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
         }
 
         // consistency check
-        if (rs->lastLogIndex >= prevLogIndex)
+        if (rs->lastLogIndex >= prevLogIndex
+                && rs->discard_index <= prevLogIndex)
         {
             if (prevLogIndex == 0)
             {
@@ -709,6 +854,14 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
     net_buf_copy(reply, (char*)&leaderId, sizeof(uint32_t));
 
     uint32_t _prevLogIndex = peer->nextIndex - 1;
+    if (_prevLogIndex < rs->discard_index)
+    {
+        loginfo("peer nextIndex(%d) is already discarded(%d) by leader.\n",
+                _prevLogIndex, rs->discard_index);
+        // TODO: abort and invoke InstallSnapshot RPC instead
+        return;
+    }
+
     uint32_t prevLogIndex = htonl(_prevLogIndex);
     net_buf_copy(reply, (char*)&prevLogIndex, sizeof(uint32_t));
 
@@ -720,7 +873,13 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
         net_buf_copy(reply, (char*)&prevLogTerm, sizeof(uint32_t));
     }
     else {
-        _prevLogTerm = rs->entries[_prevLogIndex - 1].term;
+        if (_prevLogIndex == rs->discard_index)
+        {
+            _prevLogTerm = rs->discard_term;
+        }
+        else {
+            _prevLogTerm = rs->entries[_prevLogIndex - 1].term;
+        }
         uint32_t prevLogTerm = htonl(_prevLogTerm);
         net_buf_copy(reply, (char*)&prevLogTerm, sizeof(uint32_t));
     }
@@ -1489,10 +1648,11 @@ void raft_server_stop(net_loop_t *loop, void *arg)
 
     struct raft_server *rs = kvs->rs;
     raft_free_cluster(rs->cluster);
-    close(rs->log_fd);
+    fclose(rs->log_handler);
     free(rs);
 }
 
+/*
 int main(int argc, char *argv[])
 {
     int node_id;
@@ -1580,4 +1740,119 @@ int main(int argc, char *argv[])
 
     net_loop_set_stop_callback(loop, raft_server_stop, kvs);
     net_loop_start(loop);
+}
+*/
+
+struct raft_server *raft_start_node(struct net_loop_t *loop,
+        int node_id, char*init)
+{
+    net_server_t *server =
+        net_server_init(loop, "127.0.0.1", 7777 + node_id);
+    net_server_set_message_callback(server, raft_rpc_receiver);
+
+    struct raft_server *rs = malloc(sizeof(struct raft_server));
+    rs->tcp_server = server;
+    rs->votes = 0;
+    rs->id = node_id;
+    rs->state = FOLLOWER;
+    rs->commitIndex = 0;
+    rs->lastApplied = 0;
+    rs->prevLogIndex = 0;
+    rs->prevLogTerm = 0;
+
+    char path[1024];
+    sprintf(path, "replicated-%d.log", node_id);
+    if (init)
+    {
+        // self form majority, so write local log
+        // also means commited.
+        rs->commitIndex = 1;
+        raft_init(path);
+    }
+    raft_restore_log(rs, path);
+
+    // so we can get @rs within every incoming connection
+    net_server_set_accept_callback(server, bind_raft_server, rs);
+
+    rs->cluster = calloc(1, sizeof(struct raft_cluster));
+    if (init)
+    {
+        // load membership configuration to fulfil cluster struct
+        rs->lastApplied++;
+        raft_apply(rs, rs->lastApplied);
+    }
+
+    srandom(time(NULL) + node_id);
+    net_timer_t *timer = net_timer_init(loop,
+            random_ElecttionTimeout(&rs->election_timer_rnd), 0);
+    net_timer_start(timer, start_election, rs);
+    rs->election_timer = timer;
+    rs->heartbeat_timer = NULL;
+
+    if (init) raft_become_leader(rs);
+    loginfo("raft node startup: state(%s), node_id(%d)\n",
+            raft_state(rs->state), node_id);
+
+    return rs;
+}
+
+void raft_bind_state_machine(struct raft_server *rs, void *st)
+{
+    rs->st = st;
+}
+
+int main(int argc, char *argv[])
+{
+    int node_id;
+    char *init;
+    switch (argc)
+    {
+        case 2:
+            init = NULL;
+            node_id = strtol(argv[1], NULL, 10);
+            break;
+        case 3:
+            node_id = strtol(argv[1], NULL, 10);
+            init = argv[2];
+            break;
+        default:
+            printf("usage: %s node_id [init]\n", argv[0]);
+            exit(EXIT_FAILURE);
+    }
+
+    if (init && strcmp(init, "init") != 0)
+    {
+        printf("usage: %s node_id [init]\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    net_log_level(LOG_INFO);
+    net_loop_t *loop = net_loop_init(EPOLL_SIZE);
+
+    net_server_t *app_server =
+        net_server_init(loop, "127.0.0.1", 8888 + node_id);
+    net_server_set_message_callback(app_server, client_request);
+
+    struct kv_server *kvs = malloc(sizeof(struct kv_server));
+    kvs->rs = raft_start_node(loop, node_id, init);
+    net_server_set_accept_callback(app_server, bind_kv_server, kvs);
+    raft_bind_state_machine(kvs->rs, kvs);
+
+    kvs->snapshot_path = malloc(1024);
+    sprintf(kvs->snapshot_path, "snapshot-%d", node_id);
+    if (init)
+    {
+        kvs->map = hashInit(1024);
+    }
+    else {
+        if (kv_snapshot_load(kvs))
+        {
+            kvs->map = hashInit(1024);
+        }
+    }
+
+    net_loop_set_stop_callback(loop, raft_server_stop, kvs);
+    net_loop_start(loop);
+
+    return 0;
 }

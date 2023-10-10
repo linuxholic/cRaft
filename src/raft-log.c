@@ -31,7 +31,8 @@ void raft_persist_log(struct raft_server *rs, struct raft_log_entry *entry)
 {
     // TODO: 1. atomic write these pieces of data
     //       2. deal with write failure
-    entry->file_offset = fseek(rs->log_handler, 0, SEEK_END);
+    fseek(rs->log_handler, 0, SEEK_END);
+    entry->file_offset = ftell(rs->log_handler);
     fwrite(&entry->term, sizeof(entry->term), 1, rs->log_handler);
     fwrite(&entry->cmd.len, sizeof(entry->cmd.len), 1, rs->log_handler);
     fwrite(entry->cmd.buf, entry->cmd.len, 1, rs->log_handler);

@@ -128,17 +128,16 @@ void _kv_snapshot_load(struct kv_server *kvs, int fd)
         read(fd, &key_size, 4);
         char *key = malloc(key_size + 1);
         read(fd, key, key_size);
-        key[key_size - 1] = '\0';
+        key[key_size] = '\0';
 
         int value_size;
         read(fd, &value_size, 4);
         char *value = malloc(value_size + 1);
         read(fd, value, value_size);
-        value[value_size - 1] = '\0';
+        value[value_size] = '\0';
 
         hashPut(kvs->map, key, value);
     }
-
 }
 
 int kv_snapshot_load(struct kv_server *kvs)

@@ -15,6 +15,9 @@ raft-admin: raft-cli-admin.c $(CORE)
 raft-log: raft-cli-log.c $(CORE)
 	gcc $(CFLAGS) $^ -o bin/$@
 
+raft-snapshot: raft-cli-snapshot.c $(CORE)
+	gcc $(CFLAGS) $^ -o bin/$@
+
 clean:
 	rm -f bin/*
 

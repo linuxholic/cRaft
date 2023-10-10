@@ -4,4 +4,4 @@ tags
 .cache
 compile_commands.json
 snapshot*
-*.log
+*log

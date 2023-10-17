@@ -61,15 +61,20 @@ struct raft_server
     int prevLogIndex;
     int prevLogTerm;
 
+    /* replicated log */
     FILE *log_handler;
     char *log_path;
     struct raft_log_entry *entries;
+
+    /* log compaction */
     int discard_index;
     int discard_term;
+    char *configuration_path;
 
     void *st; // state machine
 };
 
 char* raft_state(int s);
+void raft_apply_configuration();
 
 #endif // _RAFT_H_

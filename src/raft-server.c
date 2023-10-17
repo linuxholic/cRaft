@@ -427,28 +427,14 @@ void raft_snapshot(struct raft_server *rs)
     kv_snapshot_store(kvs);
 }
 
-int parse_log_entry_type(struct raft_log_entry *e)
+void raft_apply_configuration(struct raft_server *rs, uint8_t *buf)
 {
-    uint32_t *buf = e->cmd.buf;
-    return ntohl(buf[0]);
-}
+    uint8_t *cur = buf;
 
-/*
- * configuration entry format:
- * addr_num | ip_len | ip_str | port | id
- */
-void raft_apply_membership_change(
-        struct raft_server *rs, struct raft_log_entry *e)
-{
-    if (rs->state == LEADER)
-    {
-        loginfo("leader skip apply configuration entry\n");
-        return;
-    }
-
-    uint8_t *cur = e->cmd.buf;
-    cur += sizeof(uint32_t); // skip cmd type
-
+    /*
+     * configuration entry format:
+     * addr_num | ip_len | ip_str | port | id
+     */
     int addr_num = ntohl(*(uint32_t*)cur);
     cur += sizeof(uint32_t);
 
@@ -456,7 +442,7 @@ void raft_apply_membership_change(
     rc->number = addr_num;
     rc->peers = realloc(rc->peers, sizeof(struct raft_peer) * rc->number);
 
-    loginfo("apply configuration entry: addr_num(%d)\n", addr_num);
+    loginfo("apply raft configuration: addr_num(%d)\n", addr_num);
 
     for (int i = 0; i < addr_num; i++)
     {
@@ -481,22 +467,35 @@ void raft_apply_membership_change(
     }
 }
 
+void raft_apply_membership_change(
+        struct raft_server *rs, struct raft_log_entry *e)
+{
+    if (rs->state == LEADER)
+    {
+        loginfo("leader skip apply configuration entry\n");
+        return;
+    }
+    raft_apply_configuration(rs,
+            e->cmd.buf + sizeof(uint32_t) // skip cmd type
+            );
+}
+
 void raft_apply(struct raft_server *rs, int index)
 {
     struct raft_log_entry *e = &rs->entries[index - 1];
 
-    int type = parse_log_entry_type(e);
+    int type = raft_log_entry_type(e);
     switch (type)
     {
-        case 1:
+        case RAFT_LOG_STATE_MACHINE:
             raft_apply_state_machine(rs, index);
             raft_snapshot(rs);
             raft_log_compaction(rs);
             break;
-        case 2:
+        case RAFT_LOG_NO_OP:
             loginfo("apply no-op log entry.\n");
             break;
-        case 3:
+        case RAFT_LOG_CONFIGURATION:
             raft_apply_membership_change(rs, e);
             break;
         default:
@@ -1770,6 +1769,8 @@ struct raft_server *raft_start_node(struct net_loop_t *loop,
     }
     raft_restore_log(rs, path);
 
+    rs->configuration_path = "snapshot.RaftConfiguration";
+
     // so we can get @rs within every incoming connection
     net_server_set_accept_callback(server, bind_raft_server, rs);
 
@@ -1848,6 +1849,7 @@ int main(int argc, char *argv[])
         {
             kvs->map = hashInit(1024);
         }
+        raft_snapshot_load(kvs->rs);
     }
 
     net_loop_set_stop_callback(loop, raft_server_stop, kvs);

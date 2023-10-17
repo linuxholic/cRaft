@@ -5,6 +5,13 @@
 
 #define MAX_ENTRIES 1000
 
+enum raft_log_entry_type
+{
+    RAFT_LOG_STATE_MACHINE = 1,
+    RAFT_LOG_NO_OP,
+    RAFT_LOG_CONFIGURATION
+};
+
 struct raft_log_entry_cmd
 {
     void *buf;
@@ -15,7 +22,7 @@ struct raft_log_entry_cmd
      * 2: no-op log entry, upon leader elected
      * 3: configuration entry / membership change
      */
-    int type;
+    enum raft_log_entry_type type;
 };
 
 typedef void (*commit_handler)(void*);
@@ -34,24 +41,24 @@ struct raft_log_entry
 /*
  * 1. raft log layout
  *
- * currentTerm | votedFor | index | term
- * regualr entry | regular entry | ...
- * regualr entry | regular entry | ...
- * regualr entry | regular entry | ...
+ *   currentTerm | votedFor | index | term
+ *   regualr entry | regular entry | ...
+ *   regualr entry | regular entry | ...
+ *   regualr entry | regular entry | ...
  *
  * 1.1 raft log entry layout
  *
- * term | cmd_len | cmd_type | cmd_bytes
+ *   term | cmd_len | cmd_type | cmd_bytes
  *
- * cmd_len includes cmd_type and cmd_bytes
+ * @cmd_len includes cmd_type and cmd_bytes
  *
  * 1.1.1 raft config entry layout
  *
- * ip_num | ip_len | ip_str | port | id
- *        | ip_len | ip_str | port | id
- *        | ip_len | ip_str | port | id
- * 
- * corresponding to cmd_bytes
+ *   ip_num | ip_len | ip_str | port | id
+ *          | ip_len | ip_str | port | id
+ *          | ip_len | ip_str | port | id
+ *
+ * corresponding to @cmd_bytes
  *
  */
 void raft_init(char *path);
@@ -61,5 +68,7 @@ void raft_persist_log(struct raft_server *rs, struct raft_log_entry *entry);
 void raft_restore_log(struct raft_server *rs, char *path);
 void raft_log_delete(struct raft_server *rs, int idx);
 void raft_log_compaction(struct raft_server *rs);
+int  raft_log_entry_type(struct raft_log_entry *e);
+void raft_snapshot_load(struct raft_server *rs);
 
 #endif // _RAFT_LOG_H_

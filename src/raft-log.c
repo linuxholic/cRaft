@@ -1,10 +1,10 @@
-#include <stdio.h> // fopen,fclose,fread,fwrite,fflush
+#include <stdio.h>        // fopen,fclose,fread,fwrite,fflush
+#include <stdlib.h>       // malloc,calloc
+#include <unistd.h>       // fdatasync
 #include <sys/sendfile.h> // sendfile
-#include <stdlib.h> // malloc,calloc
-#include <sys/stat.h> // fstat
-#include <string.h> // memcpy
-#include <unistd.h> // fdatasync
-#include <errno.h> // errno
+#include <string.h>       // memcpy
+#include <sys/stat.h>     // fstat
+#include <errno.h>        // errno
 
 #include "raft.h"
 #include "raft-log.h"
@@ -159,9 +159,81 @@ void raft_log_delete(struct raft_server *rs, int idx)
     rs->lastLogTerm = rs->entries[rs->lastLogIndex - 1].term;
 }
 
+int raft_log_entry_type(struct raft_log_entry *e)
+{
+    uint32_t *buf = e->cmd.buf;
+    return ntohl(buf[0]);
+}
+
+void raft_snapshot_load(struct raft_server *rs)
+{
+    FILE *f = fopen(rs->configuration_path, "r");
+    if (f == NULL)
+    {
+        logerr("fail to open raft snapshot file: %s\n",
+                rs->configuration_path);
+        return;
+    }
+    loginfo("loading raft snapshot file: %s\n", rs->configuration_path);
+
+    struct stat stat_file;
+    fstat(fileno(f), &stat_file);
+    uint8_t *cur = malloc(sizeof(uint8_t) * stat_file.st_size);
+    fread(cur, stat_file.st_size, 1, f);
+    fclose(f);
+
+    raft_apply_configuration(rs,
+            cur + sizeof(uint32_t) // skip cmd type
+            );
+    free(cur);
+}
+
+void _raft_log_compaction_retain_configuration(
+        struct raft_server *rs, int idx)
+{
+    FILE *f = fopen(rs->configuration_path, "w");
+    if (f == NULL)
+    {
+        logerr("fail to open file: %s\n", rs->configuration_path);
+        return;
+    }
+
+    struct raft_log_entry *e = &rs->entries[idx - 1];
+    fwrite(e->cmd.buf, e->cmd.len, 1, f);
+    loginfo("persist raft configuration entry into %s\n",
+            rs->configuration_path);
+
+    fflush(f);
+    fdatasync(fileno(f));
+    fclose(f);
+}
+
+void raft_log_compaction_retain_configuration(
+        struct raft_server *rs, int idx)
+{
+    while (idx > rs->discard_index)
+    {
+        struct raft_log_entry *e = &rs->entries[idx - 1];
+        int type = raft_log_entry_type(e);
+        if (type == RAFT_LOG_CONFIGURATION) // configuration entry
+        {
+            _raft_log_compaction_retain_configuration(rs, idx);
+            break;
+        }
+        idx--;
+    }
+}
+
+// suggested snapshot file names:
+//
+//   snapshot.StateMachine
+//   snapshot.RaftConfiguration
+//   snapshot.RaftLogDiscardedIndexAndTerm
+//
 void raft_log_compaction(struct raft_server *rs)
 {
     int commitIndex = rs->commitIndex;
+    raft_log_compaction_retain_configuration(rs, commitIndex);
     struct raft_log_entry *e = &rs->entries[commitIndex - 1];
     rs->discard_index = commitIndex;
     rs->discard_term = e->term;

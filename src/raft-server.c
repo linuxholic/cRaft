@@ -239,8 +239,13 @@ void RequestVote_receiver(net_connect_t *c, uint32_t *res)
             lastLogIndex, lastLogTerm);
 
     int remain = net_timer_remain(rs->election_timer);
-    if (remain > rs->election_timer_rnd)
+    if (rs->state == FOLLOWER && remain > rs->election_timer_rnd)
     {
+        /*
+         * if a server receives a RequestVote request within the minimum
+         * election timeout of HEARING FROM A CURRENT LEADER, it does not
+         * update its term or grant its vote.
+         */
         loginfo("recv RequestVote RPC within MinimumElecttionTimeout(%d), "
                 "ignore it.\n", MinimumElecttionTimeout);
         return;

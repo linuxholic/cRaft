@@ -305,8 +305,10 @@ void RequestVote_receiver(net_connect_t *c, uint32_t *res)
         }
         else {
             _RequestVote_receiver(c, rs->currentTerm, 0);
-            loginfo("[%s] node(%d) deny vote to node(%d) for term(%d).\n",
-                    raft_state(rs->state), rs->id, candidateId, term);
+            loginfo("[%s] for term(%d), node(%d) already voted for node(%d),"
+                    " so deny vote to node(%d).\n",
+                    raft_state(rs->state), term, rs->id, rs->votedFor,
+                    candidateId);
         }
     }
 }
@@ -570,9 +572,10 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
         if (rs->lastLogIndex >= prevLogIndex
                 && rs->discard_index <= prevLogIndex)
         {
-            if (prevLogIndex == 0)
+            if (prevLogIndex == rs->discard_index
+                    && prevLogTerm == rs->discard_term)
             {
-                // heartbeat
+                raft_log_delete(rs, prevLogIndex + 1);
             }
             else if (rs->entries[prevLogIndex - 1].term == prevLogTerm)
             {
@@ -727,8 +730,8 @@ void raft_try_commit(struct raft_server *rs, int index)
         loginfo("log entry index[%d] commited.\n", rs->commitIndex);
 
         // commitIndex maybe take a jump instead of increment
-        // one by one, especially when new come to power, so
-        // we need following while loop to catch up.
+        // one by one, especially when new leader come to
+        // power, so we need a loop to catch up.
         while (rs->lastApplied < rs->commitIndex)
         {
             loginfo("[%s] increment lastApplied(%d -> %d).\n",
@@ -1758,8 +1761,6 @@ struct raft_server *raft_start_node(struct net_loop_t *loop,
     rs->votes = 0;
     rs->id = node_id;
     rs->state = FOLLOWER;
-    rs->commitIndex = 0;
-    rs->lastApplied = 0;
     rs->prevLogIndex = 0;
     rs->prevLogTerm = 0;
 

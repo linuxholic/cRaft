@@ -49,10 +49,14 @@ void raft_persist_log(struct raft_server *rs, struct raft_log_entry *entry)
 
 void raft_restore_log(struct raft_server *rs, char *path)
 {
-    FILE *f = fopen(path, "r+");
+    FILE *f = fopen(path, "r");
     if (f == NULL && errno == ENOENT)
     {
-        f = fopen(path, "w+");
+        f = fopen(path, "w");
+        loginfo("create raft log '%s' and write meta info.\n", path);
+    }
+    else {
+        loginfo("restore raft log '%s'\n", path);
     }
 
     if (f == NULL)
@@ -85,10 +89,18 @@ void raft_restore_log(struct raft_server *rs, char *path)
         memcpy(&rs->discard_term, bytes + cursor, 4);
         cursor += 4;
 
+        loginfo("currentTerm: %d, votedFor: %d, "
+                "discard_index: %d, discard_term: %d\n",
+                rs->currentTerm, rs->votedFor,
+                rs->discard_index, rs->discard_term);
+
+        rs->lastApplied = rs->discard_index;
+        rs->commitIndex = rs->discard_index;
+
         if (stat_log.st_size > cursor)
         {
             struct raft_log_entry *entries = rs->entries;
-            int idx = 0;
+            int idx = rs->discard_index;
             while (stat_log.st_size > cursor)
             {
                 entries[idx].file_offset = cursor;
@@ -110,12 +122,14 @@ void raft_restore_log(struct raft_server *rs, char *path)
             rs->lastLogTerm = entries[idx - 1].term;
         }
         else {
-            rs->lastLogIndex = 0;
-            rs->lastLogTerm = 0;
+            rs->lastLogIndex = rs->discard_index;
+            rs->lastLogTerm = rs->discard_term;
         }
         free(bytes);
     }
     else {
+        rs->commitIndex  = 0;
+        rs->lastApplied  = 0;
         rs->lastLogIndex = 0;
         rs->lastLogTerm  = 0;
 
@@ -132,6 +146,7 @@ void raft_restore_log(struct raft_server *rs, char *path)
         fflush(f);
         fdatasync(fileno(f));
     }
+    // don't close f, we need it afterwards.
 }
 
 // delete log entries starting from @idx
@@ -272,6 +287,7 @@ void raft_init(char *path)
                 path, strerror(errno));
         exit(EXIT_FAILURE);
     }
+    loginfo("init raft log for first node.\n");
 
     /*              meta info                */
 

@@ -57,10 +57,6 @@ struct raft_server
     int lastLogIndex;
     int lastLogTerm;
 
-    /* AppendEntries RPC */
-    int prevLogIndex;
-    int prevLogTerm;
-
     /* replicated log */
     FILE *log_handler;
     char *log_path;

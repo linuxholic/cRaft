@@ -1658,97 +1658,6 @@ void raft_server_stop(net_loop_t *loop, void *arg)
     free(rs);
 }
 
-/*
-int main(int argc, char *argv[])
-{
-    int node_id;
-    char *init;
-    switch (argc)
-    {
-        case 2:
-            init = NULL;
-            node_id = strtol(argv[1], NULL, 10);
-            break;
-        case 3:
-            node_id = strtol(argv[1], NULL, 10);
-            init = argv[2];
-            break;
-        default:
-            printf("usage: %s node_id [init]\n", argv[0]);
-            exit(EXIT_FAILURE);
-    }
-
-    if (init && strcmp(init, "init") != 0)
-    {
-        printf("usage: %s node_id [init]\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    net_log_level(LOG_INFO);
-    net_loop_t *loop = net_loop_init(EPOLL_SIZE);
-
-    net_server_t *server =
-        net_server_init(loop, "127.0.0.1", 7777 + node_id);
-    net_server_set_message_callback(server, raft_rpc_receiver);
-
-    net_server_t *app_server =
-        net_server_init(loop, "127.0.0.1", 8888 + node_id);
-    net_server_set_message_callback(app_server, client_request);
-
-    struct raft_server *rs = malloc(sizeof(struct raft_server));
-    rs->tcp_server = server;
-    rs->votes = 0;
-    rs->id = node_id;
-    rs->state = FOLLOWER;
-    rs->commitIndex = 0;
-    rs->lastApplied = 0;
-    rs->prevLogIndex = 0;
-    rs->prevLogTerm = 0;
-
-    char path[1024];
-    sprintf(path, "replicated-%d.log", node_id);
-    if (init)
-    {
-        // self form majority, so write local log
-        // also means commited.
-        rs->commitIndex = 1;
-        raft_init(path);
-    }
-    raft_restore_log(rs, path);
-
-    // so we can get @rs within every incoming connection
-    net_server_set_accept_callback(server, bind_raft_server, rs);
-
-    struct kv_server *kvs = malloc(sizeof(struct kv_server));
-    kvs->rs = rs;
-    kvs->map = hashInit(1024);
-    net_server_set_accept_callback(app_server, bind_kv_server, kvs);
-    rs->st = kvs;
-
-    rs->cluster = calloc(1, sizeof(struct raft_cluster));
-    if (init)
-    {
-        // load membership configuration to fulfil cluster struct
-        rs->lastApplied++;
-        raft_apply(rs, rs->lastApplied);
-    }
-
-    srandom(time(NULL) + node_id);
-    net_timer_t *timer = net_timer_init(loop,
-            random_ElecttionTimeout(&rs->election_timer_rnd), 0);
-    net_timer_start(timer, start_election, rs);
-    rs->election_timer = timer;
-    rs->heartbeat_timer = NULL;
-
-    if (init) raft_become_leader(rs);
-    loginfo("raft node startup: state(%s), node_id(%d)\n",
-            raft_state(rs->state), node_id);
-
-    net_loop_set_stop_callback(loop, raft_server_stop, kvs);
-    net_loop_start(loop);
-}
-*/
-
 struct raft_server *raft_start_node(struct net_loop_t *loop,
         int node_id, char*init)
 {
@@ -1761,8 +1670,6 @@ struct raft_server *raft_start_node(struct net_loop_t *loop,
     rs->votes = 0;
     rs->id = node_id;
     rs->state = FOLLOWER;
-    rs->prevLogIndex = 0;
-    rs->prevLogTerm = 0;
 
     char path[1024];
     sprintf(path, "replicated-%d.log", node_id);

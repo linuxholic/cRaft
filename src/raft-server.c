@@ -114,10 +114,38 @@ void kv_snapshot_store(struct kv_server *kvs)
     close(fd);
 }
 
+void kv_snapshot_replace(struct kv_server *kvs, char *tmp)
+{
+    struct stat buffer;
+    char *path = kvs->snapshot_path;
+    if (stat(path, &buffer) == 0)
+    {
+        remove(path);
+        loginfo("kv_snapshot_replace: discard existing snapshot.\n");
+    }
+    else {
+        if (errno == ENOENT)
+        {
+            loginfo("kv_snapshot_replace: no snapshot.\n");
+        }
+        else {
+            logerr("stat snapshot file '%s' error: %s\n",
+                    path, strerror(errno));
+            return;
+        }
+    }
+
+    rename(tmp, kvs->snapshot_path);
+    loginfo("kv_snapshot_replace: rename '%s' to '%s'.",
+            tmp, kvs->snapshot_path);
+}
+
 void _kv_snapshot_load(struct kv_server *kvs, int fd)
 {
     int buckets_count;
     read(fd, &buckets_count, 4);
+
+    if (kvs->map) hashDestroy(kvs->map);
     kvs->map = hashInit(buckets_count);
 
     int keys_count;
@@ -496,8 +524,8 @@ void raft_apply(struct raft_server *rs, int index)
     {
         case RAFT_LOG_STATE_MACHINE:
             raft_apply_state_machine(rs, index);
-            raft_snapshot(rs);
-            raft_log_compaction(rs);
+            raft_snapshot(rs); // save state machine's state
+            raft_log_compaction(rs); // save raft's state
             break;
         case RAFT_LOG_NO_OP:
             loginfo("apply no-op log entry.\n");
@@ -575,11 +603,11 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
             if (prevLogIndex == rs->discard_index
                     && prevLogTerm == rs->discard_term)
             {
-                raft_log_delete(rs, prevLogIndex + 1);
+                raft_log_delete_suffix(rs, prevLogIndex + 1);
             }
             else if (rs->entries[prevLogIndex - 1].term == prevLogTerm)
             {
-                raft_log_delete(rs, prevLogIndex + 1);
+                raft_log_delete_suffix(rs, prevLogIndex + 1);
             }
             else {
                 loginfo("log term not match\n");
@@ -620,7 +648,7 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
                 exit(EXIT_FAILURE);
             }
 
-            raft_persist_log(rs, entry);
+            raft_persist_log_entry(rs, entry);
         }
 
         _AppendEntries_receiver(c, rs->currentTerm, 1);
@@ -762,6 +790,97 @@ void raft_commit(struct raft_server *rs)
     }
 }
 
+static void _load_file(net_buf_t *reply, char *path)
+{
+    FILE *f = fopen(path, "r");
+    struct stat stat_file;
+    fstat(fileno(f), &stat_file);
+    uint8_t *cur = malloc(sizeof(uint8_t) * stat_file.st_size);
+    fread(cur, stat_file.st_size, 1, f);
+    fclose(f);
+
+    uint32_t size = htonl(stat_file.st_size);
+    net_buf_copy(reply, (char*)&size, sizeof(uint32_t));
+    net_buf_copy(reply, (char*)cur, stat_file.st_size);
+    free(cur);
+}
+
+int _InstallSnapshot_invoke(char *start, size_t size, net_connect_t *c)
+{
+    // partial results
+    if (size < 4) return 0;
+
+    // decode results
+    uint32_t *res = (uint32_t *)start;
+    uint32_t term    = ntohl(res[0]);
+
+    struct raft_server *rs = c->client->user_data;
+
+    loginfo("[%s] InstallSnapshot_invoke recv response: term(%u).\n",
+            raft_state(rs->state), term);
+
+    // whenever see larger term, update local currentTerm
+    if (term > rs->currentTerm)
+    {
+        // pause heartbeat to peers
+        net_timer_reset(rs->heartbeat_timer, 0, 0);
+
+        loginfo("[%s] node(%d) update term: %d -> %d.\n",
+                raft_state(rs->state), rs->id, rs->currentTerm, term);
+
+        rs->currentTerm = term;
+        raft_persist_currentTerm(rs);
+        rs->votedFor = -1;
+        raft_persist_votedFor(rs);
+
+        rs->state = FOLLOWER;
+        loginfo("raft leader: convert to follower.\n");
+        net_timer_reset(rs->election_timer,
+                random_ElecttionTimeout(&rs->election_timer_rnd), 0);
+    }
+
+    net_connection_set_close(c); // non-keepalive
+    return size;
+}
+
+void InstallSnapshot_invoke(struct raft_server *rs, net_connect_t *peer_c)
+{
+    loginfo("send snapshot to peer.\n");
+    net_buf_t *reply = net_buf_create(0);
+
+    uint32_t term = htonl(rs->currentTerm);
+    net_buf_copy(reply, (char*)&term, sizeof(uint32_t));
+
+    uint32_t leaderId = htonl(rs->id);
+    net_buf_copy(reply, (char*)&leaderId, sizeof(uint32_t));
+
+    uint32_t lastIndex = htonl(rs->discard_index);
+    net_buf_copy(reply, (char*)&lastIndex, sizeof(uint32_t));
+
+    uint32_t lastTerm = htonl(rs->discard_term);
+    net_buf_copy(reply, (char*)&lastTerm, sizeof(uint32_t));
+
+    // load raft cluster membership configuration into @reply
+    _load_file(reply, rs->configuration_path);
+
+    uint32_t offset = htonl(0);
+    net_buf_copy(reply, (char*)&offset, sizeof(uint32_t));
+
+    // load state machine snapshot data into @reply
+    struct kv_server *kvs = rs->st;
+    _load_file(reply, kvs->snapshot_path);
+
+    uint32_t done = htonl(1);
+   
+    // send to wire
+    list_append(&peer_c->outbuf, &reply->node);
+    net_connection_send(peer_c);
+
+    net_client_set_response_callback(peer_c->client,
+            _InstallSnapshot_invoke);
+    net_client_set_user_data(peer_c->client, rs);
+}
+
 struct raft_peer* raft_get_peer(struct raft_cluster* rc, char *addr, int port)
 {
     struct raft_peer *peer = NULL;
@@ -864,7 +983,7 @@ void __AppendEntries_invoke(net_connect_t *c, void *arg)
     {
         loginfo("peer nextIndex(%d) is already discarded(%d) by leader.\n",
                 _prevLogIndex, rs->discard_index);
-        // TODO: abort and invoke InstallSnapshot RPC instead
+        InstallSnapshot_invoke(rs, c);
         return;
     }
 
@@ -971,7 +1090,7 @@ void _AppendEntries_invoke(struct raft_server *local, struct raft_peer *peer,
 void raft_log_replication(struct raft_server *rs,
         struct raft_log_entry *entry)
 {
-    raft_persist_log(rs, entry);
+    raft_persist_log_entry(rs, entry);
 
     struct raft_peer *self = raft_get_peer(rs->cluster,
             rs->tcp_server->local_host, rs->tcp_server->local_port);
@@ -1202,6 +1321,164 @@ void RemoveServer_receiver(net_connect_t *c, uint32_t *res)
     raft_commit_callback(e, AddServer_response, c);
 }
 
+void _InstallSnapshot_receiver(net_connect_t *c, int term)
+{
+    net_buf_t *reply = net_buf_create(0);
+
+    int _term = htonl(term);
+    net_buf_copy(reply, (char*)&_term, sizeof(int));
+
+    loginfo("InstallSnapshot result: term(%u).\n", term);
+
+    list_append(&c->outbuf, &reply->node);
+    net_connection_send(c);
+}
+
+void raft_update_term(struct raft_server *rs, int term)
+{
+    loginfo("[%s] node(%d) update term: %d -> %d.\n",
+            raft_state(rs->state), rs->id, rs->currentTerm, term);
+
+    rs->currentTerm = term;
+    raft_persist_currentTerm(rs);
+    rs->votedFor = -1;
+    raft_persist_votedFor(rs);
+}
+
+char *raft_save_tmp_snapshot(uint8_t *buf, int size)
+{
+    char *path = "snapshot.StateMachine.tmp";
+    FILE *f = fopen(path, "w");
+    fwrite(buf, size, 1, f);
+    fflush(f);
+    fdatasync(fileno(f));
+    fclose(f);
+    return path;
+}
+
+/* caller should guarantee that @idx > rs->discard_index */
+void raft_incr_discard_index(struct raft_server *rs, int idx)
+{
+    int iter = idx;
+    while (iter > rs->discard_index)
+    {
+        free(rs->entries[iter - 1].cmd.buf);
+        rs->entries[iter - 1].cmd.buf = NULL;
+        rs->entries[iter - 1].cmd.len = 0;
+        iter--;
+    }
+
+    rs->discard_index = idx;
+}
+
+void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
+{
+    uint8_t *cur = (uint8_t*)(res + 1); // skip raft rpc type
+    struct raft_server *rs = c->data;
+
+    uint32_t term      = ntohl(*(uint32_t*)cur); cur += sizeof(uint32_t);
+    uint32_t leaderId  = ntohl(*(uint32_t*)cur); cur += sizeof(uint32_t);
+    uint32_t lastIndex = ntohl(*(uint32_t*)cur); cur += sizeof(uint32_t);
+    uint32_t lastTerm  = ntohl(*(uint32_t*)cur); cur += sizeof(uint32_t);
+
+    loginfo("[%s] recv InstallSnapshot RPC: term(%u), "
+            "leaderId(%u), lastIndex(%u), lastTerm(%u)\n",
+            raft_state(rs->state), term,
+            leaderId, lastIndex, lastTerm);
+
+    if (rs->currentTerm > term)
+    {
+        _InstallSnapshot_receiver(c, rs->currentTerm);
+        loginfo("recv RequestVote RPC with lower term(%d,%d), ignore it.\n",
+                rs->currentTerm, term);
+        return;
+    }
+    else {
+        // whenever see larger term, update local currentTerm
+        if (term > rs->currentTerm)
+        {
+            raft_update_term(rs, term);
+
+            // whenever see larger term, convert to FOLLOWER
+            if (rs->state != FOLLOWER)
+            {
+                loginfo("node(%d) convert state: %s -> %s.\n", rs->id,
+                        raft_state(rs->state), raft_state(FOLLOWER));
+                rs->state = FOLLOWER;
+            }
+        }
+
+        // receive snapshot
+        //   snapshot.StateMachine.ID
+        //   snapshot.RaftConfiguration.ID
+        //   snapshot.RaftLogDiscardedIndexAndTerm.ID
+
+        uint32_t size_rcc = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        // buffer for raft cluster configuration
+        uint8_t *buf_rcc = cur;
+        cur += size_rcc;
+
+        uint32_t offset = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        // buffer for state machine snapshot
+        uint32_t size_kvs = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+        char *tmp_path = raft_save_tmp_snapshot(cur, size_kvs);
+        cur += size_kvs;
+
+        uint32_t done = ntohl(*(uint32_t*)cur);
+        cur += sizeof(uint32_t);
+
+        /* if lastIndex is larger than latest snapshot's, save snapshot
+         * file and Raft state (lastIndex, lastTerm, lastConfig).
+         * Discard any existing or partial snapshot. */
+        if (lastIndex > rs->discard_index)
+        {
+            // TODO: register this to raft as callback
+            kv_snapshot_replace(rs->st, tmp_path);
+
+            // overwrite previous raft cluster configuration
+            raft_persist_configuration(rs, buf_rcc, size_rcc);
+
+            // overwrite previous discard_index and term
+            // TODO: free space of skipped entries
+            raft_incr_discard_index(rs, lastIndex);
+            raft_persist_lastIndex(rs);
+            rs->discard_term = lastTerm;
+            raft_persist_lastTerm(rs);
+
+            /* if existing log entry has same index and term as lastIndex
+             * and lastTerm, discard log up through lastIndex(but retain
+             * any following entries) and reply. */
+            if (lastIndex <= rs->lastLogIndex
+                    && rs->entries[lastIndex - 1].term == lastTerm)
+            {
+                raft_log_delete_prefix(rs, lastIndex);
+                _InstallSnapshot_receiver(c, rs->currentTerm);
+                return;
+            }
+
+            /* discard the entire log */
+            raft_log_delete_all(rs);
+
+            /* reset state machine using snapshot contents
+             * (and load lastConfig as cluster configuration) */
+            kv_snapshot_load(rs->st);
+            raft_apply_configuration(rs,
+                    buf_rcc + sizeof(uint32_t) // skip cmd type
+                    );
+        }
+
+        // reply to leader
+        _InstallSnapshot_receiver(c, rs->currentTerm);
+        net_timer_reset(rs->election_timer,
+                random_ElecttionTimeout(&rs->election_timer_rnd), 0);
+    }
+}
+
 int raft_follower(char *start, size_t size, net_connect_t *c)
 {
     // decode results
@@ -1226,6 +1503,10 @@ int raft_follower(char *start, size_t size, net_connect_t *c)
                 return 0;
             }
             AppendEntries_receiver(c, res);
+            break;
+
+        case INSTALL_SNAPSHOT:
+            InstallSnapshot_receiver(c, res);
             break;
 
         default:
@@ -1680,7 +1961,7 @@ struct raft_server *raft_start_node(struct net_loop_t *loop,
         rs->commitIndex = 1;
         raft_init(path);
     }
-    raft_restore_log(rs, path);
+    raft_log_restore(rs, path);
 
     rs->configuration_path = "snapshot.RaftConfiguration";
 
@@ -1748,6 +2029,9 @@ int main(int argc, char *argv[])
 
     struct kv_server *kvs = malloc(sizeof(struct kv_server));
     kvs->rs = raft_start_node(loop, node_id, init);
+    kvs->map = NULL;
+    kvs->snapshot_path = NULL;
+
     net_server_set_accept_callback(app_server, bind_kv_server, kvs);
     raft_bind_state_machine(kvs->rs, kvs);
 

@@ -35,6 +35,7 @@ enum raft_rpc_type
     , APPEND_ENTRIES
     , ADD_SERVER
     , REMOVE_SERVER
+    , INSTALL_SNAPSHOT
 };
 
 struct raft_server
@@ -65,12 +66,13 @@ struct raft_server
     /* log compaction */
     int discard_index;
     int discard_term;
-    char *configuration_path;
+    char *configuration_path; // raft cluster membership
 
     void *st; // state machine
 };
 
 char* raft_state(int s);
 void raft_apply_configuration();
+void raft_incr_discard_index(struct raft_server *rs, int idx);
 
 #endif // _RAFT_H_

@@ -89,8 +89,7 @@ void raft_snapshot_load(struct raft_server *rs)
     FILE *f = fopen(rs->configuration_path, "r");
     if (f == NULL)
     {
-        logerr("fail to open raft snapshot file: %s\n",
-                rs->configuration_path);
+        loginfo("no raft snapshot file: %s\n", rs->configuration_path);
         return;
     }
     loginfo("loading raft snapshot file: %s\n", rs->configuration_path);
@@ -109,10 +108,10 @@ void raft_snapshot_load(struct raft_server *rs)
 
 void raft_log_restore(struct raft_server *rs, char *path)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(path, "r+");
     if (f == NULL && errno == ENOENT)
     {
-        f = fopen(path, "w");
+        f = fopen(path, "w+");
         loginfo("create raft log '%s' and write meta info.\n", path);
     }
     else {

@@ -179,7 +179,7 @@ int kv_snapshot_load(struct kv_server *kvs)
     else {
         if (errno == ENOENT)
         {
-            loginfo("no snapshot file, skip loading.\n");
+            loginfo("no kv snapshot file, skip loading.\n");
         }
         else {
             logerr("stat snapshot file '%s' error: %s\n",

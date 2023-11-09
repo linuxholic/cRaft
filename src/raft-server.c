@@ -1963,7 +1963,9 @@ struct raft_server *raft_start_node(struct net_loop_t *loop,
     }
     raft_log_restore(rs, path);
 
-    rs->configuration_path = "snapshot.RaftConfiguration";
+    rs->configuration_path = malloc(1024);
+    sprintf(rs->configuration_path,
+            "snapshot.RaftConfiguration.%d", node_id);
 
     // so we can get @rs within every incoming connection
     net_server_set_accept_callback(server, bind_raft_server, rs);
@@ -2036,7 +2038,7 @@ int main(int argc, char *argv[])
     raft_bind_state_machine(kvs->rs, kvs);
 
     kvs->snapshot_path = malloc(1024);
-    sprintf(kvs->snapshot_path, "snapshot-%d", node_id);
+    sprintf(kvs->snapshot_path, "snapshot.StateMachine.%d", node_id);
     if (init)
     {
         kvs->map = hashInit(1024);

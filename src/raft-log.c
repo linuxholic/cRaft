@@ -265,32 +265,27 @@ static void _raft_log_delete_prefix(struct raft_server *rs, int idx)
 {
     struct stat stat_log;
     fstat(fileno(rs->log_handler), &stat_log);
-
     struct raft_log_entry *e = &rs->entries[idx - 1];
     off_t new_start = e->file_offset + 8 + e->cmd.len;
-
     size_t count = stat_log.st_size - new_start;
 
-    FILE *f = fopen("truncated_log", "w");
-
-    // meta info
-    fwrite(&rs->currentTerm,   4, 1, f);
-    fwrite(&rs->votedFor,      4, 1, f);
-
-    // log entries
-    fwrite(&rs->discard_index, 4, 1, f);
-    fwrite(&rs->discard_term,  4, 1, f);
-    sendfile(fileno(f), fileno(rs->log_handler), &new_start, count);
-    fflush(f);
-    fdatasync(fileno(f));
+    char truncated_log[] = "raft_truncated_log_XXXXXX";
+    int fd = mkstemp(truncated_log);
+    write(fd, &rs->currentTerm, 4);
+    write(fd, &rs->votedFor, 4);
+    write(fd, &rs->discard_index, 4);
+    write(fd, &rs->discard_term, 4);
+    sendfile(fd, fileno(rs->log_handler), &new_start, count);
+    fdatasync(fd);
 
     // rotate raft log file
     fclose(rs->log_handler);
     remove(rs->log_path);
-    fclose(f);
-    rename("truncated_log", rs->log_path);
+    close(fd);
+    rename(truncated_log, rs->log_path);
     rs->log_handler = fopen(rs->log_path, "r+");
 }
+
 
 void raft_log_delete_all(struct raft_server *rs)
 {
@@ -314,11 +309,15 @@ void raft_log_delete_prefix(struct raft_server *rs, int idx)
 void raft_log_compaction(struct raft_server *rs)
 {
     int commitIndex = rs->commitIndex;
+
     raft_log_compaction_retain_configuration(rs, commitIndex);
 
-    raft_incr_discard_index(rs, commitIndex);
+    rs->discard_index = commitIndex;
     rs->discard_term = rs->entries[commitIndex - 1].term;
+    /* free disk space */
     raft_log_delete_prefix(rs, commitIndex);
+    /* free mem space */
+    raft_free_log_entries(rs, commitIndex);
 }
 
 void raft_init(char *path)

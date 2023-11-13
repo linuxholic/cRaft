@@ -1357,7 +1357,7 @@ char *raft_save_tmp_snapshot(uint8_t *buf, int size)
 }
 
 /* caller should guarantee that @idx > rs->discard_index */
-void raft_incr_discard_index(struct raft_server *rs, int idx)
+void raft_free_log_entries(struct raft_server *rs, int idx)
 {
     int iter = idx;
     while (iter > rs->discard_index)
@@ -1367,8 +1367,6 @@ void raft_incr_discard_index(struct raft_server *rs, int idx)
         rs->entries[iter - 1].cmd.len = 0;
         iter--;
     }
-
-    rs->discard_index = idx;
 }
 
 void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
@@ -1444,8 +1442,7 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
             raft_persist_configuration(rs, buf_rcc, size_rcc);
 
             // overwrite previous discard_index and term
-            // TODO: free space of skipped entries
-            raft_incr_discard_index(rs, lastIndex);
+            rs->discard_index = lastIndex;
             raft_persist_lastIndex(rs);
             rs->discard_term = lastTerm;
             raft_persist_lastTerm(rs);
@@ -1456,7 +1453,11 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
             if (lastIndex <= rs->lastLogIndex
                     && rs->entries[lastIndex - 1].term == lastTerm)
             {
+                // TODO: merge these two functions into one ??
                 raft_log_delete_prefix(rs, lastIndex);
+                raft_free_log_entries(rs, lastIndex);
+
+                // reply to peer
                 _InstallSnapshot_receiver(c, rs->currentTerm);
                 return;
             }

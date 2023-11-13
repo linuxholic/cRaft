@@ -73,6 +73,6 @@ struct raft_server
 
 char* raft_state(int s);
 void raft_apply_configuration();
-void raft_incr_discard_index(struct raft_server *rs, int idx);
+void raft_free_log_entries(struct raft_server *rs, int idx);
 
 #endif // _RAFT_H_

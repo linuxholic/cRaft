@@ -1358,13 +1358,12 @@ void raft_update_term(struct raft_server *rs, int term)
 
 char *raft_save_tmp_snapshot(uint8_t *buf, int size)
 {
-    char *path = "snapshot.StateMachine.tmp";
-    FILE *f = fopen(path, "w");
-    fwrite(buf, size, 1, f);
-    fflush(f);
-    fdatasync(fileno(f));
-    fclose(f);
-    return path;
+    static char tmp_snapshot_path[] = "snapshot.StateMachine.tmp.XXXXXX";
+    int fd = mkstemp(tmp_snapshot_path);
+    write(fd, buf, size);
+    fdatasync(fd);
+    close(fd);
+    return tmp_snapshot_path;
 }
 
 /* caller should guarantee that @idx > rs->discard_index */
@@ -1448,6 +1447,7 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
         {
             // TODO: register this to raft as callback
             kv_snapshot_replace(rs->st, tmp_path);
+            remove(tmp_path);
 
             // overwrite previous raft cluster configuration
             raft_persist_configuration(rs, buf_rcc, size_rcc);

@@ -15,7 +15,7 @@ void raft_persist_lastTerm(struct raft_server *rs)
     fwrite(&rs->discard_term, 4, 1, rs->log_handler);
     fflush(rs->log_handler);
     fdatasync(fileno(rs->log_handler));
-    loginfo("persist lastTerm:%d\n", rs->votedFor);
+    loginfo("persist lastTerm:%d\n", rs->discard_term);
 }
 
 void raft_persist_lastIndex(struct raft_server *rs)
@@ -24,7 +24,7 @@ void raft_persist_lastIndex(struct raft_server *rs)
     fwrite(&rs->discard_index, 4, 1, rs->log_handler);
     fflush(rs->log_handler);
     fdatasync(fileno(rs->log_handler));
-    loginfo("persist lastIndex:%d\n", rs->votedFor);
+    loginfo("persist lastIndex:%d\n", rs->discard_index);
 }
 
 void raft_persist_votedFor(struct raft_server *rs)

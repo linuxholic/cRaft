@@ -136,7 +136,7 @@ void kv_snapshot_replace(struct kv_server *kvs, char *tmp)
     }
 
     rename(tmp, kvs->snapshot_path);
-    loginfo("kv_snapshot_replace: rename '%s' to '%s'.",
+    loginfo("kv_snapshot_replace: rename '%s' to '%s'.\n",
             tmp, kvs->snapshot_path);
 }
 
@@ -805,6 +805,21 @@ static void _load_file(net_buf_t *reply, char *path)
     free(cur);
 }
 
+struct raft_peer* raft_get_peer(struct raft_cluster* rc, char *addr, int port)
+{
+    struct raft_peer *peer = NULL;
+    for (int i = 0; i < rc->number; i++)
+    {
+        peer = &rc->peers[i];
+        if (peer->port == port
+            && strcmp(peer->addr, addr) == 0)
+        {
+            break;
+        }
+    }
+    return peer;
+}
+
 int _InstallSnapshot_invoke(char *start, size_t size, net_connect_t *c)
 {
     // partial results
@@ -818,6 +833,9 @@ int _InstallSnapshot_invoke(char *start, size_t size, net_connect_t *c)
 
     loginfo("[%s] InstallSnapshot_invoke recv response: term(%u).\n",
             raft_state(rs->state), term);
+
+    struct raft_peer *peer = raft_get_peer(rs->cluster,
+                             c->client->peer_host, c->client->peer_port);
 
     // whenever see larger term, update local currentTerm
     if (term > rs->currentTerm)
@@ -838,6 +856,11 @@ int _InstallSnapshot_invoke(char *start, size_t size, net_connect_t *c)
         net_timer_reset(rs->election_timer,
                 random_ElecttionTimeout(&rs->election_timer_rnd), 0);
     }
+    else {
+        // TODO: rs->discard_index may has changed
+        peer->nextIndex = rs->discard_index;
+        peer->matchIndex = peer->nextIndex - 1;
+    }
 
     net_connection_set_close(c); // non-keepalive
     return size;
@@ -847,6 +870,9 @@ void InstallSnapshot_invoke(struct raft_server *rs, net_connect_t *peer_c)
 {
     loginfo("send snapshot to peer.\n");
     net_buf_t *reply = net_buf_create(0);
+
+    uint32_t rpc_type = htonl(INSTALL_SNAPSHOT);
+    net_buf_copy(reply, (char*)&rpc_type, sizeof(uint32_t));
 
     uint32_t term = htonl(rs->currentTerm);
     net_buf_copy(reply, (char*)&term, sizeof(uint32_t));
@@ -871,7 +897,7 @@ void InstallSnapshot_invoke(struct raft_server *rs, net_connect_t *peer_c)
     _load_file(reply, kvs->snapshot_path);
 
     uint32_t done = htonl(1);
-   
+
     // send to wire
     list_append(&peer_c->outbuf, &reply->node);
     net_connection_send(peer_c);
@@ -879,21 +905,6 @@ void InstallSnapshot_invoke(struct raft_server *rs, net_connect_t *peer_c)
     net_client_set_response_callback(peer_c->client,
             _InstallSnapshot_invoke);
     net_client_set_user_data(peer_c->client, rs);
-}
-
-struct raft_peer* raft_get_peer(struct raft_cluster* rc, char *addr, int port)
-{
-    struct raft_peer *peer = NULL;
-    for (int i = 0; i < rc->number; i++)
-    {
-        peer = &rc->peers[i];
-        if (peer->port == port
-            && strcmp(peer->addr, addr) == 0)
-        {
-            break;
-        }
-    }
-    return peer;
 }
 
 int ___AppendEntries_invoke(char *start, size_t size, net_connect_t *c)
@@ -1441,6 +1452,8 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
             // overwrite previous raft cluster configuration
             raft_persist_configuration(rs, buf_rcc, size_rcc);
 
+            loginfo("save snapshot file and Raft state.\n");
+
             // overwrite previous discard_index and term
             rs->discard_index = lastIndex;
             raft_persist_lastIndex(rs);
@@ -1459,11 +1472,13 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
 
                 // reply to peer
                 _InstallSnapshot_receiver(c, rs->currentTerm);
+                loginfo("discard log up through lastIndex(%d).\n", lastIndex);
                 return;
             }
 
             /* discard the entire log */
             raft_log_delete_all(rs);
+            loginfo("discard the entire log.\n");
 
             /* reset state machine using snapshot contents
              * (and load lastConfig as cluster configuration) */
@@ -1471,6 +1486,10 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
             raft_apply_configuration(rs,
                     buf_rcc + sizeof(uint32_t) // skip cmd type
                     );
+        }
+        else {
+            loginfo("lastIndex is less than or equal to "
+                    "lastest snapshot's, ignore it.\n");
         }
 
         // reply to leader

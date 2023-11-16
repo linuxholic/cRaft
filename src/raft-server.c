@@ -618,7 +618,10 @@ void AppendEntries_receiver(net_connect_t *c, uint32_t *res)
             }
         }
         else {
-            loginfo("log index not match\n");
+            loginfo("log index not match: "
+                    "lastIndex(%d), prevLogIndex(%d), lastLogIndex(%d).\n",
+                    rs->discard_index, prevLogIndex, rs->lastLogIndex);
+
             _AppendEntries_receiver(c, rs->currentTerm, 0);
             net_timer_reset(rs->election_timer,
                     random_ElecttionTimeout(&rs->election_timer_rnd), 0);
@@ -858,7 +861,7 @@ int _InstallSnapshot_invoke(char *start, size_t size, net_connect_t *c)
     }
     else {
         // TODO: rs->discard_index may has changed
-        peer->nextIndex = rs->discard_index;
+        peer->nextIndex = rs->discard_index + 1;
         peer->matchIndex = peer->nextIndex - 1;
     }
 
@@ -1477,8 +1480,11 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
             }
 
             /* discard the entire log */
-            raft_log_delete_all(rs);
+            raft_log_delete_prefix(rs, rs->lastLogIndex);
+            raft_free_log_entries(rs, rs->lastLogIndex);
             loginfo("discard the entire log.\n");
+            rs->lastLogIndex = lastIndex;
+            rs->lastLogTerm = lastTerm;
 
             /* reset state machine using snapshot contents
              * (and load lastConfig as cluster configuration) */
@@ -1486,10 +1492,13 @@ void InstallSnapshot_receiver(net_connect_t *c, uint32_t *res)
             raft_apply_configuration(rs,
                     buf_rcc + sizeof(uint32_t) // skip cmd type
                     );
+            rs->commitIndex = lastIndex;
+            rs->lastApplied = lastIndex;
         }
         else {
-            loginfo("lastIndex is less than or equal to "
-                    "lastest snapshot's, ignore it.\n");
+            loginfo("lastIndex(%d) is less than or equal to "
+                    "lastest snapshot's(%d), ignore it.\n",
+                    lastIndex, rs->discard_index);
         }
 
         // reply to leader

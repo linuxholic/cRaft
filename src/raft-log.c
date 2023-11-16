@@ -263,11 +263,29 @@ void raft_log_delete_suffix(struct raft_server *rs, int idx)
 /* delete log entries up through and INCLUDING @idx */
 static void _raft_log_delete_prefix(struct raft_server *rs, int idx)
 {
+    size_t count;
+    off_t new_start;
     struct stat stat_log;
+
     fstat(fileno(rs->log_handler), &stat_log);
-    struct raft_log_entry *e = &rs->entries[idx - 1];
-    off_t new_start = e->file_offset + 8 + e->cmd.len;
-    size_t count = stat_log.st_size - new_start;
+    if (idx > rs->discard_index)
+    {
+        // TODO: we need check every and each of these array index ops
+        struct raft_log_entry *e = &rs->entries[idx - 1];
+        new_start = e->file_offset + 8 + e->cmd.len;
+        count = stat_log.st_size - new_start;
+    }
+    else if (idx == rs->discard_index)
+    {
+        new_start = stat_log.st_size;
+        count = 0;
+    }
+    else {
+        logerr("failed to delete log prefix: "
+                "idx(%d) is less than discard_index(%d).\n",
+                idx, rs->discard_index);
+        return;
+    }
 
     char truncated_log[] = "raft_truncated_log_XXXXXX";
     int fd = mkstemp(truncated_log);
@@ -286,11 +304,6 @@ static void _raft_log_delete_prefix(struct raft_server *rs, int idx)
     rs->log_handler = fopen(rs->log_path, "r+");
 }
 
-
-void raft_log_delete_all(struct raft_server *rs)
-{
-    _raft_log_delete_prefix(rs, rs->lastLogIndex);
-}
 
 void raft_log_delete_prefix(struct raft_server *rs, int idx)
 {

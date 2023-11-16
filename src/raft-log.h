@@ -72,7 +72,6 @@ void raft_persist_configuration(struct raft_server *rs, void *buf, int len);
 void raft_persist_log_entry(struct raft_server *rs, struct raft_log_entry *entry);
 
 void raft_log_restore(struct raft_server *rs, char *path);
-void raft_log_delete_all(struct raft_server *rs);
 void raft_log_delete_suffix(struct raft_server *rs, int idx);
 void raft_log_delete_prefix(struct raft_server *rs, int idx);
 void raft_log_compaction(struct raft_server *rs);
